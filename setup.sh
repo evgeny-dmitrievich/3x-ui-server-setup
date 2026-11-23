@@ -4,6 +4,11 @@
 set -Eeuo pipefail
 umask 077
 
+# Use UTF-8 within this process without changing the system-wide locale.
+# The Linux virtual console (tty1 etc.) also needs a font with Cyrillic glyphs.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
+
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified
@@ -76,6 +81,37 @@ if [[ -r /etc/ssh/sshd_config ]]; then
   fi
 fi
 
+# Configure a Cyrillic-capable console font BEFORE the first Russian prompts.
+# Same safe approach as our 3ax-server-setup: do not change OS-wide language.
+PHASE='Preparing console font'
+BACKUP_DIR="/root/3x-ui-setup-backup-$(date +%Y%m%d-%H%M%S)"
+install -d -m 700 "$BACKUP_DIR"
+printf '[3x-ui] Preparing UTF-8 / Cyrillic Linux console font...\n'
+apt-get -y -o 'Dpkg::Options::=--force-confold' update
+apt-get -y -o 'Dpkg::Options::=--force-confold' install \
+  console-setup console-setup-linux kbd openssh-client
+if [[ -f /etc/default/console-setup ]]; then
+  cp -a /etc/default/console-setup "$BACKUP_DIR/console-setup.orig"
+  for entry in 'CHARMAP="UTF-8"' 'CODESET="Uni2"' 'FONTFACE="Terminus"' 'FONTSIZE="8x16"'; do
+    key=${entry%%=*}
+    if grep -q "^${key}=" /etc/default/console-setup; then
+      sed -i "s/^${key}=.*/${entry}/" /etc/default/console-setup
+    else
+      printf '%s\n' "$entry" >> /etc/default/console-setup
+    fi
+  done
+  CONSOLE_TTY=$(tty 2>/dev/null || true)
+  if [[ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] &&
+     [[ "${TERM:-}" == linux || "$CONSOLE_TTY" =~ ^/dev/tty[0-9]+$ ]]; then
+    if ! setupcon --force >/dev/null 2>&1; then
+      printf '[3x-ui] Warning: console font could not be applied; try SSH terminal.\n' >&2
+    fi
+  fi
+else
+  printf '[3x-ui] Warning: console-setup configuration is missing.\n' >&2
+fi
+PHASE='Проверки и исходные параметры'
+
 cat <<'INTRO'
 Установщик НЕ читает и НЕ восстанавливает SQLite-базу.
 Ты загрузишь её позже в панели 3x-ui через HTTPS.
@@ -121,13 +157,8 @@ printf '%s\n' "$PUBLIC_KEY" > "$KEYTMP"
 ssh-keygen -lf "$KEYTMP" >/dev/null 2>&1 || { rm -f "$KEYTMP"; die 'Недопустимый публичный ключ.'; }
 rm -f "$KEYTMP"
 
-BACKUP_DIR="/root/3x-ui-setup-backup-$(date +%Y%m%d-%H%M%S)"
-install -d -m 700 "$BACKUP_DIR"
-
 PHASE='Системные пакеты и инструменты'
 say 'Устанавливаю пакеты, firewall, Fail2ban, Nginx и stream-модуль.'
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl openssh-server sudo ufw fail2ban python3 \
   nginx libnginx-mod-stream certbot openssl iproute2 sqlite3
 
