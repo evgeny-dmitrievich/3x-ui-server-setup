@@ -7,7 +7,6 @@ import ipaddress
 import json
 import pathlib
 import re
-import shutil
 import sqlite3
 import sys
 
@@ -125,12 +124,22 @@ def describe(c):
     return result
 
 
-def save_db(c, source, target, domain, cert, key):
+def save_db(c, source, target, domain, cert, key, old_host=None):
     if pathlib.Path(source).resolve() == pathlib.Path(target).resolve():
         raise ValueError("Нельзя изменять оригинал базы")
     if pathlib.Path(target).exists():
         raise ValueError("Выходной файл уже существует, отказ от перезаписи")
-    shutil.copy2(source, target)
+    # SQLite can use WAL: a raw file copy may silently omit recent writes.
+    # The SQLite backup API captures one consistent database snapshot.
+    dst = sqlite3.connect(target)
+    try:
+        c.backup(dst)
+    except Exception:
+        dst.close()
+        pathlib.Path(target).unlink(missing_ok=True)
+        raise
+    finally:
+        dst.close()
     t = connect(target, readonly=False)
     try:
         with t:
@@ -142,10 +151,15 @@ def save_db(c, source, target, domain, cert, key):
                 "subJsonURI": f"https://{domain}{path(cfg(t)['subJsonPath'])}",
                 "subClashURI": f"https://{domain}{path(cfg(t)['subClashPath'])}",
                 "subDomain": domain,
+                "webDomain": domain,
             }.items():
                 setting(t,k,v)
-            # All public client endpoints on external 443 should point to the NEW host.
-            t.execute("UPDATE hosts SET address=? WHERE address IS NOT NULL AND address != ''", (domain,))
+            # On initial import, replace hosts from the original server.
+            # On later domain changes, replace ONLY the previously managed address.
+            if old_host:
+                t.execute("UPDATE hosts SET address=? WHERE address=?", (domain, old_host))
+            else:
+                t.execute("UPDATE hosts SET address=? WHERE address IS NOT NULL AND address != ''", (domain,))
             for r in t.execute("SELECT id,stream_settings,settings,protocol FROM inbounds").fetchall():
                 s = json.loads(r["stream_settings"] or "{}")
                 d = json.loads(r["settings"] or "{}")
@@ -218,6 +232,11 @@ server {{
     ssl_certificate_key {key};
     ssl_protocols TLSv1.2 TLSv1.3;
     client_max_body_size 16m;
+    error_page 404 /404.html;
+    location = /404.html {{
+        internal;
+        root /var/www/3x-ui-landing;
+    }}
     location = {ws_one} {{
         proxy_pass http://127.0.0.1:10451;
         proxy_http_version 1.1;
@@ -239,10 +258,9 @@ server {{
     }}
     location ^~ {d['web_path']} {{
         proxy_pass https://127.0.0.1:{d['web_port']};
-        proxy_ssl_server_name on;
-        proxy_ssl_name {domain};
-        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
-        proxy_ssl_verify on;
+        # The upstream is the local 3x-ui HTTPS server, bound to loopback only.
+        # The public TLS connection is independently verified by the browser.
+        proxy_ssl_verify off;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Real-IP $remote_addr;
@@ -251,15 +269,24 @@ server {{
     for sub_path in d['sub_paths']:
         http_conf += f'''    location ^~ {sub_path} {{
         proxy_pass https://127.0.0.1:{d['sub_port']};
-        proxy_ssl_server_name on;
-        proxy_ssl_name {domain};
-        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
-        proxy_ssl_verify on;
+        # The upstream is the local 3x-ui HTTPS server, bound to loopback only.
+        # The public TLS connection is independently verified by the browser.
+        proxy_ssl_verify off;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
     }}
 '''
-    http_conf += '''    location / { return 404; }
+    # The ordinary homepage is entirely static. It does not reveal or redirect
+    # visitors to the private panel. Admin and subscription paths above win.
+    http_conf += '''    location = / {
+        root /var/www/3x-ui-landing;
+        try_files /index.html =404;
+    }
+    location = /index.html {
+        root /var/www/3x-ui-landing;
+        try_files /index.html =404;
+    }
+    location / { return 404; }
 }
 '''
     pathlib.Path(http_out).write_text(http_conf)
@@ -274,6 +301,7 @@ def main():
     ap.add_argument('--cert')
     ap.add_argument('--key')
     ap.add_argument('--out')
+    ap.add_argument('--old-host', default=None)
     ap.add_argument('--http-out')
     ap.add_argument('--stream-out')
     args = ap.parse_args()
@@ -291,7 +319,7 @@ def main():
                 raise ValueError('Используй абсолютные пути к сертификатам без пробелов')
         if args.mode=='prepare':
             if not args.out: ap.error('Нужен --out')
-            save_db(c,args.db,args.out,domain,args.cert,args.key)
+            save_db(c,args.db,args.out,domain,args.cert,args.key,args.old_host)
             print('Копия базы подготовлена; источник не изменён.')
         else:
             if not args.http_out or not args.stream_out:

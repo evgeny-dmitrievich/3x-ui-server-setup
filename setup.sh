@@ -40,7 +40,7 @@ usage() {
     -o /tmp/3x-ui-setup.sh && sudo bash /tmp/3x-ui-setup.sh
 
 Устанавливаются: официальная 3x-ui, SSL для своего домена ИЛИ публичного IP,
-Nginx (443 -> HTTPS-панель), SSH 1335, UFW и Fail2ban.
+Nginx (443 -> HTTPS-панель + сайт о природе), SSH 1335, UFW и Fail2ban.
 После импорта базы выполняется простая команда:
   sudo 3x-ui-after-import
 Она применяет уже выданный сертификат и настраивает VPN-маршруты.
@@ -195,9 +195,13 @@ systemctl disable nginx >/dev/null 2>&1 || true
 rm -f /etc/nginx/sites-enabled/default
 
 PHASE='Установка помощника для шага после импорта'
-say 'Загружаю инструмент, который понадобится ПОСЛЕ восстановления базы.'
+say 'Загружаю инструменты после импорта и смены домена/IP.'
 install -d -m 755 /usr/local/lib/3x-ui-setup
-for spec in 'configure-after-import.sh /usr/local/sbin/3x-ui-after-import' 'db_tool.py /usr/local/lib/3x-ui-setup/db_tool.py'; do
+for spec in \
+  'configure-after-import.sh /usr/local/sbin/3x-ui-after-import' \
+  'change-domain.sh /usr/local/sbin/3x-ui-change-domain' \
+  'stack-manager.sh /usr/local/sbin/3x-ui-stack-manager' \
+  'db_tool.py /usr/local/lib/3x-ui-setup/db_tool.py'; do
   read -r src dest <<< "$spec"
   curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/${src}" -o "${dest}.tmp" || die "Не удалось скачать ${src} из репозитория. Проверь публикацию всех файлов."
   if [[ "$src" == *.sh ]]; then bash -n "${dest}.tmp" || die 'Ошибка синтаксиса помощника'; else python3 - "${dest}.tmp" <<'PY' || die 'Ошибка Python-синтаксиса помощника'
@@ -205,6 +209,16 @@ import ast,sys
 ast.parse(open(sys.argv[1],encoding='utf-8').read())
 PY
   fi
+  install -m 755 -o root -g root "${dest}.tmp" "$dest"
+  rm -f "${dest}.tmp"
+done
+
+PHASE='Подготовка помощника WireGuard'
+for spec in 'wireguard/setup.sh /usr/local/sbin/3x-ui-wg-setup' \
+            'wireguard/manage.sh /usr/local/sbin/3x-ui-wg'; do
+  read -r src dest <<< "$spec"
+  curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/${src}" -o "${dest}.tmp" || die "Не удалось скачать ${src}. Убедись, что папка wireguard опубликована в GitHub."
+  bash -n "${dest}.tmp" || die "Ошибка синтаксиса ${src}."
   install -m 755 -o root -g root "${dest}.tmp" "$dest"
   rm -f "${dest}.tmp"
 done
@@ -258,6 +272,7 @@ ufw allow 1335/tcp comment 'Admin SSH'
 ufw allow 80/tcp comment 'Certificate ACME HTTP-01'
 ufw allow 443/tcp comment 'Nginx stream TLS'
 ufw allow 13133/tcp comment 'VLESS Reality direct'
+ufw allow 51820/udp comment 'Standalone WireGuard wg0'
 for p in 443 8444 51821 51822; do ufw allow "$p/udp" comment '3x-ui UDP inbound'; done
 ufw --force enable
 ufw status | grep -q '^Status: active' || die 'UFW не активировался.'
@@ -334,26 +349,20 @@ install -d -m 700 /etc/3x-ui-setup
   printf 'SSL_HOST=%q\n' "$SSL_HOST"
   printf 'SSL_CERT=%q\n' "$SSL_CERT"
   printf 'SSL_KEY=%q\n' "$SSL_KEY"
+  printf 'SSL_EMAIL=%q\n' "$SSL_EMAIL"
   printf 'PUBLIC_IPV4=%q\n' "$PUBLIC_IPV4"
 } > "$SSL_STATE_FILE"
 chmod 600 "$SSL_STATE_FILE"
 
-# An initial 443/TCP stream forwards TLS unmodified to 3x-ui HTTPS:13350.
-# The after-import tool replaces it with the complete VPN SNI router.
+# Before import, TCP 443 forwards to a local Nginx TLS terminator,
+# serving the public nature landing and proxying all other paths to the panel.
+# After import, the manager replaces both Nginx routes while retaining the landing.
 PHASE='Первичный HTTPS через Nginx'
-install -d -m 755 /etc/nginx/stream.conf.d
-cat > /etc/nginx/stream.conf.d/00-3x-ui-bootstrap.conf <<'STREAM_BOOT'
-# Pre-import only: HTTPS on TCP 443 -> built-in panel TLS on 13350.
-stream {
-    server {
-        listen 443;
-        listen [::]:443;
-        proxy_pass 127.0.0.1:13350;
-        proxy_connect_timeout 10s;
-        proxy_timeout 1h;
-    }
-}
-STREAM_BOOT
+say 'Устанавливаю природную страницу-заглушку и локальный HTTPS-прокси панели.'
+LANDING_INSTALL="$BACKUP_DIR/landing-install.sh"
+curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/landing/install.sh" -o "$LANDING_INSTALL" || die 'Не удалось скачать установщик сайта-заглушки.'
+bash -n "$LANDING_INSTALL" || die 'Ошибка синтаксиса установщика сайта-заглушки.'
+bash "$LANDING_INSTALL" "$SSL_HOST" "$SSL_CERT" "$SSL_KEY" "$PANEL_PORT" "$REPO_RAW_BASE" || die 'Не удалось установить сайт-заглушку.'
 python3 - <<'PYNGINX'
 from pathlib import Path
 import re
@@ -367,6 +376,18 @@ PYNGINX
 nginx -t || die 'Nginx не принял стартовую HTTPS-конфигурацию.'
 systemctl enable --now nginx
 ss -H -ltn 'sport = :443' | grep -q . || die 'Nginx не слушает TCP 443.'
+# Fail early if the ordinary public landing page is not reachable via real TLS/SNI.
+BOOT_HTTP_STATUS=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 \
+  --resolve "${SSL_HOST}:443:127.0.0.1" "https://${SSL_HOST}/") || die 'Стартовая страница не открывается через Nginx.'
+[[ "$BOOT_HTTP_STATUS" == 200 ]] || die "Стартовая страница ответила HTTP ${BOOT_HTTP_STATUS}, ожидался 200."
+BOOT_404_STATUS=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 \
+  --resolve "${SSL_HOST}:443:127.0.0.1" "https://${SSL_HOST}/__missing_nature_page_3xui__") || die 'Страница 404 не открывается через Nginx.'
+[[ "$BOOT_404_STATUS" == 404 ]] || die "Несуществующая страница ответила HTTP ${BOOT_404_STATUS}, ожидался 404."
+
+
+PHASE='Самостоятельный WireGuard с двумя профилями'
+say 'Настраиваю WireGuard (UDP 51820) и создаю профили «Роутер» и «Роутер (Катя)».'
+bash /usr/local/sbin/3x-ui-wg-setup "$PUBLIC_IPV4" "$SSH_USER" || die 'WireGuard не установился. SSH 22 остаётся доступен, пока установка не завершена.'
 
 PHASE='Подтверждение SSH на 1335'
 cat <<SSHVERIFY
@@ -429,7 +450,8 @@ PHASE='Готово'
 say "3x-ui установлена, HTTPS включён для ${SSL_HOST}. База ещё НЕ ИМПОРТИРОВАНА."
 cat <<END
 
-1) Панель открывается по HTTPS через TCP 443:
+1) На https://${SSL_HOST}/ показывается публичная страница о природе.
+   Панель открывается по HTTPS на её прежнем секретном пути через TCP 443:
    https://${SSL_HOST}/ПУТЬ_ИЗ_ФАЙЛА/
 
    Посмотреть случайный путь и логин/пароль панели:
@@ -444,8 +466,20 @@ cat <<END
    Он использует уже выданный сертификат для ${SSL_HOST},
    маршрутизирует VPN через TCP 443 и обновит адреса подписок.
 
-4) Рекомендуется проверить выпуск и продление сертификата:
+4) В любой момент можно изменить домен или вернуться на IP:
+   sudo 3x-ui-change-domain
+
+5) Рекомендуется проверить выпуск и продление сертификата:
    sudo /root/.acme.sh/acme.sh --list
+
+WireGuard: создан отдельный сервер UDP 51820 и два профиля:
+   «Роутер» и «Роутер (Катя)».
+   Безопасно выгрузить их в домашнюю папку SSH-пользователя:
+   sudo 3x-ui-wg export all
+   Посмотреть статус или создать следующий профиль:
+   sudo 3x-ui-wg status
+   sudo 3x-ui-wg add 'Название'
+   Затем скачай *.conf через SFTP/SSH (порт 1335).
 
 Резервные копии: ${BACKUP_DIR}
 Также открой TCP 80/443 и нужные UDP-порты в firewall VPS-провайдера.
