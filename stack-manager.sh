@@ -189,25 +189,68 @@ ensure_cert() {
   validate_cert "$host" "$TARGET_CERT" "$TARGET_KEY" || die 'Полученный сертификат не соответствует адресу или ключу.'
 }
 
-# Require the local endpoint to respond as a web panel, not just accept TCP.
+# Verify real HTTP responses; allow the panel to finish starting after systemd
+# reports active. acme.sh --installcert may restart x-ui immediately beforehand.
+# Keep probes on loopback, bypass inherited HTTP(S)_PROXY settings and never
+# print private panel/subscription URLs or credentials in diagnostics.
 healthcheck() {
   CURRENT_STEP='Проверка веб-панели'
-  local db=$1 host=$2 port base code
+  local db=$1 host=$2 port base code status start ready=0 attempt=0
   port=$(python3 "$DB_TOOL" inspect --db "$db" | python3 -c 'import json,sys; print(json.load(sys.stdin)["web_port"])') || return 1
   base=$(python3 "$DB_TOOL" inspect --db "$db" | python3 -c 'import json,sys; print(json.load(sys.stdin)["web_path"])') || return 1
-  # Probe upstream first, then complete public TLS/SNI path via local Nginx.
-  code=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 7 "https://127.0.0.1:${port}${base}" 2>/dev/null) || return 1
-  [[ "$code" =~ ^(2[0-9][0-9]|3[0-9][0-9]|401|403)$ ]] || { warn "Внутренняя панель ответила $code"; return 1; }
-  code=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 10 \
-    --resolve "${host}:443:127.0.0.1" "https://${host}${base}" 2>/dev/null) || return 1
-  [[ "$code" =~ ^(2[0-9][0-9]|3[0-9][0-9]|401|403)$ ]] || { warn "Через Nginx панель ответила $code"; return 1; }
-  code=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 10 \
-    --resolve "${host}:443:127.0.0.1" "https://${host}/" 2>/dev/null) || return 1
-  [[ "$code" == 200 ]] || { warn "Сайт-заглушка ответил $code вместо 200"; return 1; }
-  code=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 10 \
-    --resolve "${host}:443:127.0.0.1" "https://${host}/__missing_nature_page_3xui__" 2>/dev/null) || return 1
-  [[ "$code" == 404 ]] || { warn "Несуществующая страница ответила $code вместо HTTP 404"; return 1; }
-  say "Панель отвечает через Nginx; сайт-заглушка HTTP 200 и страница 404 проверены."
+
+  # The web server often binds 1-3 seconds after systemctl start/restart.
+  # The certificate hook above can restart it once more. Limit this wait to
+  # approximately 12 seconds (individual curl calls have a 2-second cap).
+  start=$SECONDS
+  code='соединение не установлено'
+  while :; do
+    attempt=$((attempt+1))
+    if status=$(curl --noproxy '*' -ksS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 1 --max-time 2 "https://127.0.0.1:${port}${base}" 2>/dev/null); then
+      code=$status
+      if [[ "$code" =~ ^(2[0-9][0-9]|3[0-9][0-9]|401|403)$ ]]; then
+        ready=1
+        break
+      fi
+    else
+      code='нет HTTPS-соединения'
+    fi
+    (( SECONDS - start < 12 )) || break
+    sleep 1
+  done
+  if (( ! ready )); then
+    warn "Локальная панель не ответила ожидаемым HTTP-кодом на порту ${port} (последний результат: ${code}; попыток: ${attempt})."
+    warn 'Проверь, совпадает ли порт в восстановленной SQLite-базе с фактическим портом процесса x-ui.'
+    return 1
+  fi
+
+  # Validate the full path through the Nginx TCP/SNI router to this panel.
+  # --noproxy is important if the server has HTTPS_PROXY set in its environment.
+  if ! code=$(curl --noproxy '*' -ksS -o /dev/null -w '%{http_code}' \
+      --connect-timeout 2 --max-time 5 --resolve "${host}:443:127.0.0.1" \
+      "https://${host}${base}" 2>/dev/null); then
+    warn 'Не удалось соединиться с панелью через Nginx/TCP 443.'
+    return 1
+  fi
+  [[ "$code" =~ ^(2[0-9][0-9]|3[0-9][0-9]|401|403)$ ]] || { warn "Через Nginx панель ответила HTTP ${code}."; return 1; }
+
+  if ! code=$(curl --noproxy '*' -ksS -o /dev/null -w '%{http_code}' \
+      --connect-timeout 2 --max-time 5 --resolve "${host}:443:127.0.0.1" \
+      "https://${host}/" 2>/dev/null); then
+    warn 'Не удалось открыть главную страницу через Nginx.'
+    return 1
+  fi
+  [[ "$code" == 200 ]] || { warn "Сайт-заглушка ответил HTTP ${code} вместо 200."; return 1; }
+
+  if ! code=$(curl --noproxy '*' -ksS -o /dev/null -w '%{http_code}' \
+      --connect-timeout 2 --max-time 5 --resolve "${host}:443:127.0.0.1" \
+      "https://${host}/__missing_nature_page_3xui__" 2>/dev/null); then
+    warn 'Не удалось проверить страницу 404 через Nginx.'
+    return 1
+  fi
+  [[ "$code" == 404 ]] || { warn "Несуществующая страница ответила HTTP ${code} вместо 404."; return 1; }
+  say 'Панель отвечает через Nginx; сайт-заглушка HTTP 200 и страница 404 проверены.'
 }
 
 apply_stack() {
