@@ -140,8 +140,8 @@ case "${HAS_DOMAIN,,}" in
   n|no|н|нет|'') SSL_MODE=ip ;;
   *) die 'Ответь y или N.' ;;
 esac
-read -r -p 'Email для сертификатов Let's Encrypt: ' SSL_EMAIL
-[[ "$SSL_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Укажи действительный email для Let's Encrypt.'
+read -r -p "Email для сертификатов Let's Encrypt: " SSL_EMAIL
+[[ "$SSL_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "Укажи действительный email для Let's Encrypt."
 read -r -p 'Новый SSH-логин (латиница): ' SSH_USER
 [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ && "$SSH_USER" != root ]] || die 'Некорректный SSH-логин.'
 ! getent passwd "$SSH_USER" >/dev/null || die 'Такой пользователь уже существует.'
