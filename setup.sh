@@ -160,7 +160,7 @@ rm -f "$KEYTMP"
 PHASE='Системные пакеты и инструменты'
 say 'Устанавливаю пакеты, firewall, Fail2ban, Nginx и stream-модуль.'
 apt-get install -y --no-install-recommends ca-certificates curl openssh-server sudo ufw fail2ban python3 \
-  nginx libnginx-mod-stream certbot openssl iproute2 sqlite3
+  nginx libnginx-mod-stream certbot openssl iproute2 sqlite3 python3-systemd
 
 # ACME can only issue for a reachable PUBLIC IP. Domain must resolve directly
 # to this address, not a reverse-proxy CDN or somebody else's server.
@@ -272,9 +272,34 @@ maxretry = 3
 findtime = 10m
 bantime = 12h
 JAIL
-systemctl enable --now fail2ban
-systemctl restart fail2ban
-fail2ban-client status sshd >/dev/null || die 'Fail2ban не запустился.'
+# Ubuntu can return from 'systemctl restart' before the Unix socket is ready.
+# Verify config and wait for the jail; on a real failure print the actual service logs.
+if ! fail2ban-client -t; then
+  systemctl status fail2ban --no-pager -l || true
+  journalctl -u fail2ban -n 35 --no-pager || true
+  die 'Ошибка конфигурации Fail2ban; смотри сообщения выше.'
+fi
+systemctl enable fail2ban
+if ! systemctl restart fail2ban; then
+  systemctl status fail2ban --no-pager -l || true
+  journalctl -u fail2ban -n 35 --no-pager || true
+  die 'Fail2ban не смог перезапуститься; смотри журнал выше.'
+fi
+FAIL2BAN_READY=0
+for ((attempt=0; attempt<12; attempt++)); do
+  if systemctl is-active --quiet fail2ban && fail2ban-client status sshd >/dev/null 2>&1; then
+    FAIL2BAN_READY=1
+    break
+  fi
+  if systemctl is-failed --quiet fail2ban; then break; fi
+  if (( attempt < 11 )); then sleep 1; fi
+done
+if (( ! FAIL2BAN_READY )); then
+  systemctl status fail2ban --no-pager -l || true
+  journalctl -u fail2ban -n 35 --no-pager || true
+  die 'Fail2ban не готов или sshd-jail не запущен.'
+fi
+say 'Fail2ban готов, защита sshd включена.'
 
 PHASE='Официальная панель 3x-ui'
 say 'Устанавливаю свежую стабильную версию официальной 3x-ui (БЕЗ базы).'
