@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.6.0
+# PROJECT_VERSION=2.8.0
 # 3x-ui setup v2: preserve panel credentials, paths, and all VPN identities.
 # Maintains the Nginx SNI routes and HTTPS certificates for the imported database.
 set -Eeuo pipefail
 umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-PROJECT_VERSION='2.6.0'
+PROJECT_VERSION='2.8.0'
 STATE=/etc/3x-ui-setup/bootstrap.env
 LIVE_DB=/etc/x-ui/x-ui.db
 DB_TOOL=/usr/local/lib/3x-ui-setup/db_tool.py
@@ -98,8 +98,8 @@ HELP
 if [[ ${1:-} == '--help' || ${1:-} == '-h' ]]; then usage; exit 0; fi
 [[ $EUID -eq 0 ]] || die 'Нужны права root (sudo).'
 [[ -r "$STATE" && -f "$DB_TOOL" && -f "$NGINX_MAIN" && -f "$LIVE_DB" ]] || die 'Нет состояния установки, панели или базы.'
-grep -Fqx "# PROJECT_VERSION=${PROJECT_VERSION}" "$DB_TOOL" \
-  || die "Версии db_tool.py и stack-manager.sh не совпадают. Обнови оба файла из одного выпуска ${PROJECT_VERSION}; база не изменена."
+# No hardcoded project/panel version gate: the DB helper validates actual schema.
+python3 -m py_compile "$DB_TOOL" || die 'db_tool.py содержит синтаксическую ошибку.' 
 [[ -x "$ACME" ]] || die 'Не установлен acme.sh (официальная установка 3x-ui должна его создать).'
 command -v flock >/dev/null || die 'Нет команды flock.'
 exec 9>/run/3x-ui-stack-manager.lock
@@ -270,12 +270,14 @@ apply_stack() {
   [[ -t 0 ]] || die 'Требуется интерактивный терминал.'
   validate_host "$new_host" || die 'Некорректный домен или IPv4.'
   [[ "$new_host" != dl.google.com && "$new_host" != apple.com && "$new_host" != www.amazon.com && "$new_host" != www.samsung.com ]] || die 'Нельзя использовать домен-маскировку как публичный адрес.'
-  python3 "$DB_TOOL" inspect --db "$LIVE_DB" > /dev/null || die 'В активной базе не найдены нужные протоколы по портам. Возможно восстановление было отклонено. Подготовь исходный файл через 3x-ui-prepare-import, импортируй его и только затем повтори эту команду.'
+  python3 "$DB_TOOL" inspect --db "$LIVE_DB" > /dev/null || die 'Не удалось прочитать настройки панели (webPort/webBasePath) из активной базы. Проверь, завершился ли импорт.'
   [[ -s /var/www/3x-ui-landing/index.html ]] || die 'Не найдена страница-заглушка. Проверь файлы установки.' 
   [[ -s /var/www/3x-ui-landing/404.html ]] || die 'Не найдена страница 404. Проверь файлы установки.' 
   if [[ "$phase" == after-import ]]; then
-    [[ ! -e "$STREAM_FINAL" && ! -e "$HTTP_CONF" ]] || die 'Настройка после импорта уже выполнялась. Для смены адреса используй 3x-ui-change-domain.'
-    [[ -f "$STREAM_BOOT" && -L "$HTTP_BOOT_LINK" ]] || die 'Нет временной конфигурации Nginx; отказ от изменения других Nginx-схем.'
+    # Re-imports are normal, so after-import is deliberately idempotent.
+    if [[ ! -f "$STREAM_FINAL" || ! -f "$HTTP_CONF" ]]; then
+      [[ -f "$STREAM_BOOT" && -L "$HTTP_BOOT_LINK" ]] || die 'Нет ни управляемой, ни временной конфигурации Nginx; чужую конфигурацию не перезаписываем.'
+    fi
   else
     [[ -f "$STREAM_FINAL" && -f "$HTTP_CONF" ]] || die 'Сначала выполни sudo 3x-ui-after-import.'
   fi
@@ -345,6 +347,18 @@ PY
     warn 'Не удалось обновить команду автопродления сертификата в acme.sh. Проверь вручную.'
   fi
   healthcheck "$LIVE_DB" "$TARGET_HOST" || die 'Панель недоступна после изменений; выполняю откат.'
+
+  # Dynamically allow externally bound UDP VPN inbounds without opening arbitrary
+  # TCP ports or removing existing firewall rules. Done ONLY after healthcheck.
+  CURRENT_STEP='Обновление UDP firewall'
+  while IFS= read -r udp_port; do
+    [[ -n "$udp_port" ]] || continue
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw allow "${udp_port}/udp" comment '3x-ui imported UDP inbound' >/dev/null \
+        || warn "Не удалось разрешить UDP ${udp_port} в UFW; проверь вручную."
+    fi
+  done < <(python3 "$DB_TOOL" inspect --db "$LIVE_DB" | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); print("\n".join(str(x) for x in d.get("udp_ports", [])))')
 
   CURRENT_STEP='Сохранение SSL-состояния'
   {

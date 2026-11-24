@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.6.0
+# PROJECT_VERSION=2.8.0
 # Install an entirely offline public landing page and the pre-import HTTPS router.
-# Invoked by setup.sh or resume-after-fail2ban.sh on a CLEAN VPS.
+# Invoked by setup.sh on a CLEAN VPS.
 set -Eeuo pipefail
 umask 022
 (($# == 5)) || { echo 'Usage: install.sh HOST CERT KEY PANEL_PORT REPO_RAW_BASE' >&2; exit 2; }

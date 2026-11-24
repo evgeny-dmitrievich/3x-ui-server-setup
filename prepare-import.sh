@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.6.0
+# PROJECT_VERSION=2.8.0
 # Stage a copy of a foreign 3x-ui SQLite backup BEFORE panel restore.
 # Never change /etc/x-ui/x-ui.db, active nginx, WireGuard, or SSH.
 set -Eeuo pipefail
@@ -17,7 +17,7 @@ usage() {
   sudo 3x-ui-prepare-import --disable-tuic /home/evgen/source.db
 
 Создаёт НОВЫЙ приватный SQLite-файл рядом с исходным, не импортируя
-его в панель. Второй вариант ВРЕМЕННО отключает TUIC (8444/UDP),
+его в панель. Второй вариант ВРЕМЕННО отключает все TUIC,
 сохраняя пользователей и ключи. Используй только если обычный импорт
 после исправления сертификатов по-прежнему не проходит из-за TUIC.
 USAGE
@@ -28,7 +28,7 @@ DISABLE_TUIC=0
 if [[ ${1:-} == --disable-tuic ]]; then DISABLE_TUIC=1; shift; fi
 [[ $# == 1 ]] || { usage; exit 2; }
 [[ -r "$STATE" && -f "$TOOL" ]] || { echo 'Файлы установки не найдены.' >&2; exit 1; }
-grep -Fqx '# PROJECT_VERSION=2.6.0' "$TOOL" || { echo 'Обнови db_tool.py и prepare-import.sh одной версией.' >&2; exit 1; }
+python3 -m py_compile "$TOOL" || { echo 'db_tool.py содержит синтаксическую ошибку.' >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$STATE"
 [[ -f "$SSL_CERT" && -f "$SSL_KEY" ]] || { echo 'Нет выданных для этого сервера сертификата/ключа.' >&2; exit 1; }
@@ -36,7 +36,7 @@ source "$STATE"
 SRC=$(realpath -e -- "$1")
 [[ -f "$SRC" && "$SRC" != "$LIVE" ]] || { echo 'Нужен отдельный исходный файл, не живая база.' >&2; exit 1; }
 python3 "$TOOL" inspect --db "$SRC" >/dev/null || {
-  echo 'Исходная база не подходит по портам/протоколам. Файл не менялся.' >&2; exit 1;
+  echo 'В исходной базе не найдены необходимые настройки панели. Файл не менялся.' >&2; exit 1;
 }
 DEST="${SRC%.*}-prepared-$(date +%Y%m%d-%H%M%S).db"
 [[ ! -e "$DEST" ]] || { echo 'Выходной файл уже существует.' >&2; exit 1; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.6.0
+# PROJECT_VERSION=2.8.0
 # 3x-ui server bootstrap. NO database is needed or imported at this stage.
 # Intended for a NEW Ubuntu VPS. Source files must be published in the same GitHub repository.
 set -Eeuo pipefail
@@ -10,7 +10,7 @@ umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
 
-readonly PROJECT_VERSION='2.6.0'
+readonly PROJECT_VERSION='2.8.0'
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified
@@ -89,9 +89,9 @@ fi
 PHASE='Проверка комплекта исходных файлов'
 SOURCE_STAGE=$(mktemp -d /tmp/3x-ui-source.XXXXXXXX)
 trap 'rm -rf -- "${SOURCE_STAGE:-/nonexistent}"' EXIT
-printf "[3x-ui] Verifying release %s files before installation...\n" "$PROJECT_VERSION"
+printf '[3x-ui] Checking downloaded installation files...\n'
 SOURCE_ITEMS=(
-  setup.sh configure-after-import.sh change-domain.sh stack-manager.sh db_tool.py reality-443.sh prepare-import.sh
+  setup.sh configure-after-import.sh change-domain.sh stack-manager.sh db_tool.py prepare-import.sh
   landing/install.sh landing/index.html landing/404.html
   wireguard/setup.sh wireguard/manage.sh
 )
@@ -101,8 +101,6 @@ for src in "${SOURCE_ITEMS[@]}"; do
     "${REPO_RAW_BASE}/${src}" -o "${SOURCE_STAGE}/${src}" \
     || die "Не удалось загрузить ${src}; проверь GitHub."
   [[ -s "${SOURCE_STAGE}/${src}" ]] || die "Пустой файл ${src}."
-  grep -Fq "PROJECT_VERSION=${PROJECT_VERSION}" "${SOURCE_STAGE}/${src}" \
-    || die "Версии файлов не совпадают: ${src}. Опубликуй ВСЕ файлы одного архива в GitHub."
   case "$src" in
     *.sh) bash -n "${SOURCE_STAGE}/${src}" || die "Ошибка Bash в ${src}." ;;
     *.py) python3 - "${SOURCE_STAGE}/${src}" <<'CHECKPY' || die "Ошибка Python в ${src}."
@@ -114,7 +112,7 @@ CHECKPY
 done
 [[ -f "${0}" ]] && cmp -s -- "$0" "${SOURCE_STAGE}/setup.sh" \
   || die 'Скачанный setup.sh отличается от опубликованной версии. Загрузи весь новый проект в GitHub и скачай setup.sh заново.'
-printf "[3x-ui] Release %s files verified.\n" "$PROJECT_VERSION"
+printf '[3x-ui] All required installation files checked.\n'
 
 # Configure a Cyrillic-capable console font BEFORE the first Russian prompts.
 # Same safe approach as our 3ax-server-setup: do not change OS-wide language.
@@ -236,7 +234,6 @@ for spec in \
   'configure-after-import.sh /usr/local/sbin/3x-ui-after-import' \
   'change-domain.sh /usr/local/sbin/3x-ui-change-domain' \
   'stack-manager.sh /usr/local/sbin/3x-ui-stack-manager' \
-  'reality-443.sh /usr/local/sbin/3x-ui-reality-443' \
   'prepare-import.sh /usr/local/sbin/3x-ui-prepare-import' \
   'db_tool.py /usr/local/lib/3x-ui-setup/db_tool.py'; do
   read -r src dest <<< "$spec"

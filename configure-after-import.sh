@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.6.0
+# PROJECT_VERSION=2.8.0
 set -Eeuo pipefail
 exec /usr/local/sbin/3x-ui-stack-manager after-import "$@"

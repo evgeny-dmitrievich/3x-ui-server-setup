@@ -1,420 +1,478 @@
 #!/usr/bin/env python3
-# PROJECT_VERSION=2.6.0
-"""Private SQLite migration + nginx generation for the specific 3x-ui database.
-This program never prints passwords, keys, client UUIDs or tokens.
+"""Version-agnostic, data-driven 3x-ui SQLite -> nginx reconciler.
+
+Only edits a NEW SQLite copy. Unknown protocols are preserved, not guessed at.
+Never prints UUIDs, private keys, passwords, tokens, or subscription URLs.
 """
 import argparse
 import ipaddress
 import json
 import pathlib
 import re
+import secrets
 import sqlite3
 import sys
-import secrets
 import time
+from urllib.parse import urlparse
 
-NAME = re.compile(r"^[a-zA-Z0-9.-]+$")
-PATH = re.compile(r"^/[a-zA-Z0-9_./-]*$")
+PROJECT_VERSION = '2.8.0'
+HOST_RE = re.compile(r'^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$', re.I)
+PATH_RE = re.compile(r'^/[a-zA-Z0-9_./~%-]*$')
+CERT_RE = re.compile(r'^/[A-Za-z0-9_.\-/]+$')
+UDP_ONLY = {'hysteria', 'hysteria2', 'tuic', 'amneziawg', 'wireguard'}
 
 
-def validate_domain(text):
-    """Accept owned DNS domains OR public IPv4 used for Let's Encrypt IP SSL."""
+def public_host(text):
+    text = (text or '').strip().lower()
     try:
-        addr = ipaddress.ip_address(text)
+        ip = ipaddress.ip_address(text)
     except ValueError:
-        if not NAME.fullmatch(text) or "." not in text or ".." in text or len(text) > 253:
-            raise ValueError("Некорректный домен")
-        return text.lower()
-    if addr.version != 4 or not addr.is_global:
-        raise ValueError("Для IP SSL нужен публичный IPv4")
-    return str(addr)
+        if not HOST_RE.fullmatch(text) or '..' in text or '.' not in text:
+            raise ValueError('Некорректный домен')
+        return text
+    if ip.version != 4 or not ip.is_global:
+        raise ValueError('Ожидается публичный IPv4')
+    return str(ip)
 
 
-def connect(path, readonly=True):
-    if not pathlib.Path(path).is_file():
-        raise ValueError(f"База не найдена: {path}")
-    conn = sqlite3.connect(f"file:{pathlib.Path(path).resolve()}?mode={'ro' if readonly else 'rw'}", uri=True)
-    conn.row_factory = sqlite3.Row
-    if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-        raise ValueError("SQLite integrity_check не прошла")
-    required = {"inbounds", "settings", "hosts", "clients"}
-    present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if not required <= present:
-        raise ValueError("База не соответствует схеме 3x-ui")
-    return conn
+def conn_open(filename, readonly=True):
+    path = pathlib.Path(filename).resolve()
+    if not path.is_file():
+        raise ValueError('SQLite-файл не найден')
+    c = sqlite3.connect(f'file:{path}?mode={"ro" if readonly else "rw"}', uri=True)
+    c.row_factory = sqlite3.Row
+    if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+        c.close()
+        raise ValueError('SQLite integrity_check не прошла')
+    tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {'settings', 'inbounds'}.issubset(tables):
+        c.close()
+        raise ValueError('Не найдены таблицы settings/inbounds панели 3x-ui')
+    return c
 
 
-def cfg(c):
-    return {r["key"]: r["value"] for r in c.execute("SELECT key,value FROM settings")}
+def has_table(c, table):
+    return bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
 
 
-def setting(c, name, value):
-    if c.execute("SELECT count(*) FROM settings WHERE key=?", (name,)).fetchone()[0]:
-        c.execute("UPDATE settings SET value=? WHERE key=?", (str(value), name))
+def columns(c, table):
+    return {r['name'] for r in c.execute(f'PRAGMA table_info({table})')}
+
+
+def settings(c):
+    return {r['key']: r['value'] for r in c.execute('SELECT key,value FROM settings')}
+
+
+def set_setting(c, key, value):
+    if c.execute('SELECT 1 FROM settings WHERE key=?', (key,)).fetchone():
+        c.execute('UPDATE settings SET value=? WHERE key=?', (str(value), key))
     else:
-        c.execute("INSERT INTO settings(key,value) VALUES(?,?)", (name, str(value)))
+        c.execute('INSERT INTO settings(key,value) VALUES(?,?)', (key, str(value)))
 
 
-# Match stable inbound parameters instead of user-editable display names.
-# Custom names and emoji are encouraged in subscriptions, so remarks must
-# never be used as persistent identifiers for infrastructure provisioning.
-INBOUND_SPECS = {
-    'VPN': (13133, 'vless'),
-    'XHTTP': (10444, 'vless'),
-    'VLESS-WS': (10451, 'vless'),
-    'VMess-WS': (10452, 'vmess'),
-    'Trojan-gRPC': (10453, 'trojan'),
-    'MTProto': (10445, 'mtproto'),
-}
+def check_path(value, label, *, allow_root=False):
+    if not isinstance(value, str) or not value.startswith('/') or not PATH_RE.fullmatch(value) or '..' in value or '//' in value:
+        raise ValueError(f'Недопустимый путь {label} в настройках панели')
+    if value == '/' and not allow_root:
+        raise ValueError(f'Путь {label} совпадает с главной страницей заглушки')
+    return value
 
 
-def inbound(c, role):
-    port, protocol = INBOUND_SPECS[role]
-    rows = list(c.execute(
-        "SELECT * FROM inbounds WHERE port=? AND lower(protocol)=?",
-        (port, protocol),
-    ))
-    if len(rows) != 1:
-        raise ValueError(
-            f"Для роли {role} ожидалось одно подключение {protocol}:{port}; найдено {len(rows)}"
-        )
-    return rows[0]
-
-
-def stream(c, remark):
-    return json.loads(inbound(c, remark)["stream_settings"] or "{}")
-
-
-def path(s):
-    if not PATH.fullmatch(s) or ".." in s or "//" in s:
-        raise ValueError("Недопустимый путь из базы (возможно, другая схема)")
-    return s
-
-
-def sni(s):
-    if not NAME.fullmatch(s) or "." not in s:
-        raise ValueError("Недопустимый SNI из базы")
-    return s
-
-
-def describe(c):
-    sc = cfg(c)
-    needed = ("webBasePath", "subPath", "subJsonPath", "subClashPath", "webPort", "subPort")
-    for k in needed:
-        if not sc.get(k):
-            raise ValueError(f"Отсутствует настройка {k}")
-    # Display remarks may have been renamed (including emoji).
-    # Verify the required roles by their unique port+protocol instead.
-    for role in INBOUND_SPECS:
-        inbound(c, role)
-    x = stream(c, "XHTTP")
-    v = stream(c, "VPN")
-    mt = json.loads(inbound(c, "MTProto")["settings"] or "{}")
-    if x.get("sockopt", {}).get("acceptProxyProtocol") is not True:
-        raise ValueError("XHTTP не ожидает PROXY protocol; сценарий nginx требует проверки")
-    if mt.get("proxyProtocolListener") is not True:
-        raise ValueError("MTProto не ожидает PROXY protocol; сценарий nginx требует проверки")
-    result = {
-        "web_port": int(sc["webPort"]),
-        "sub_port": int(sc["subPort"]),
-        "web_path": path(sc["webBasePath"]),
-        "sub_paths": [path(sc[z]) for z in ("subPath", "subJsonPath", "subClashPath")],
-        "vless_sni": sni(v["realitySettings"]["serverNames"][0]),
-        "xhttp_sni": sni(x["realitySettings"]["serverNames"][0]),
-        "mtproto_sni": sni(mt["fakeTlsDomain"]),
-        "ws_vless": path(stream(c, "VLESS-WS")["wsSettings"]["path"]),
-        "ws_vmess": path(stream(c, "VMess-WS")["wsSettings"]["path"]),
-        "grpc_service": path("/" + stream(c, "Trojan-gRPC")["grpcSettings"]["serviceName"]).lstrip("/"),
-        "ports": [],
-        "clients": c.execute("SELECT count(*) FROM clients").fetchone()[0],
-        "inbounds": c.execute("SELECT count(*) FROM inbounds").fetchone()[0],
-    }
-    if len(set([result['vless_sni'], result['xhttp_sni'], result['mtproto_sni']])) != 3:
-        raise ValueError("Пересечение SNI: нельзя автоматически собрать stream-маршруты")
-    for r in c.execute("SELECT port,protocol,listen,enable,remark FROM inbounds"):
-        if not r["enable"]:
-            continue
-        prot = r["protocol"]
-        method = "udp" if prot in {"hysteria", "tuic", "amneziawg", "wireguard"} else "tcp"
-        result["ports"].append({"port": r["port"], "protocol": method, "listen": r["listen"], "remark": r["remark"]})
-    for key in ('web_port','sub_port'):
-        if not 1024 <= result[key] <= 65535:
-            raise ValueError(f"Некорректный {key}")
-    for field in ['ws_vless','ws_vmess','web_path',*result['sub_paths']]:
-        if field == '/':
-            raise ValueError("Отказ: открытый корневой path вместо отдельного пути")
+def port_int(value, label):
+    try: result = int(value)
+    except (TypeError, ValueError): raise ValueError(f'Некорректный {label}') from None
+    if not 1 <= result <= 65535:
+        raise ValueError(f'Некорректный {label}')
     return result
 
 
+def load_obj(value, label):
+    try: parsed = json.loads(value or '{}')
+    except (ValueError, TypeError): raise ValueError(f'Некорректный JSON: {label}') from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f'Ожидался JSON-объект: {label}')
+    return parsed
 
-REALITY_SNI = "dl.google.com"
-OLD_REALITY_SNI = "apple.com"
+
+def source_address(sc):
+    """Only infer addresses explicitly configured for this server.
+
+    Never replace a completely unrelated third-party address by assumption.
+    """
+    for key in ('subDomain', 'webDomain'):
+        val = (sc.get(key) or '').strip()
+        if val and val not in ('127.0.0.1', 'localhost'):
+            return val
+    for key in ('subURI', 'subJsonURI', 'subClashURI'):
+        try:
+            v = urlparse(sc.get(key) or '').hostname
+            if v and v not in ('127.0.0.1', 'localhost'):
+                return v
+        except ValueError:
+            pass
+    return None
 
 
-def migrate_vpn_reality(c, public_address):
-    """Only our named VPN inbound. Preserves keys, UUIDs, stats and unrelated inbounds."""
-    r = inbound(c, "VPN")
-    if r["port"] != 13133 or r["protocol"] != "vless":
-        raise ValueError("VPN inbound differs from expected VLESS TCP:13133")
-    s = json.loads(r["stream_settings"] or "{}")
-    if s.get("network") != "tcp" or s.get("security") != "reality":
-        raise ValueError("VPN is not TCP Reality")
-    if s.get("externalProxy"):
-        raise ValueError("VPN contains legacy externalProxy entries; review manually")
-    reality = s.get("realitySettings") or {}
-    if reality.get("serverNames") not in ([OLD_REALITY_SNI], [REALITY_SNI]):
-        raise ValueError("Unexpected VPN Reality serverNames; refusing migration")
-    if reality.get("target") not in (f"{OLD_REALITY_SNI}:443", f"{REALITY_SNI}:443"):
-        raise ValueError("Unexpected VPN Reality target; refusing migration")
-    client_sni = reality.get("settings", {}).get("serverName", "")
-    if client_sni not in ("", OLD_REALITY_SNI, REALITY_SNI):
-        raise ValueError("Unexpected VPN Reality client serverName")
-    reality["serverNames"] = [REALITY_SNI]
-    reality["target"] = f"{REALITY_SNI}:443"
-    if isinstance(reality.get("settings"), dict):
-        reality["settings"]["serverName"] = REALITY_SNI
-    s["realitySettings"] = reality
-    c.execute("UPDATE inbounds SET stream_settings=?, listen=? WHERE id=?", (
-        json.dumps(s, ensure_ascii=False, separators=(",", ":")), "127.0.0.1", r["id"]))
-    hosts = c.execute("SELECT id,address,port FROM hosts WHERE inbound_id=?", (r["id"],)).fetchall()
-    if len(hosts) > 1:
-        raise ValueError("Multiple VPN Hosts found; review before migration")
-    if hosts:
-        h = hosts[0]
-        if h["address"] not in ("", None, public_address):
-            raise ValueError("VPN Host has an external custom address; review before migration")
-        if h["port"] not in (0, 13133, 443):
-            raise ValueError("VPN Host uses unexpected port")
-        c.execute("""UPDATE hosts SET address=?,port=443,security='same',sni=?,
-          override_sni_from_address=0,keep_sni_blank=0,is_disabled=0,is_hidden=0,
-          updated_at=? WHERE id=?""", (public_address, REALITY_SNI, int(time.time()*1000), h["id"]))
-    else:
-        now = int(time.time() * 1000)
-        c.execute("""INSERT INTO hosts
-          (group_id,inbound_id,sort_order,remark,is_disabled,is_hidden,address,port,
-           security,sni,override_sni_from_address,keep_sni_blank,created_at,updated_at)
-          VALUES (?,?,0,?,0,0,?,443,'same',?,0,0,?,?)""",
-          (secrets.token_hex(8),r["id"],"VLESS Reality 443",public_address,REALITY_SNI,now,now))
+def row_data(c):
+    fields = columns(c, 'inbounds')
+    required = {'id', 'protocol', 'port', 'settings'}
+    if not required.issubset(fields):
+        raise ValueError('В таблице inbounds отсутствуют обязательные поля')
+    rows = []
+    for r in c.execute('SELECT * FROM inbounds ORDER BY id'):
+        protocol = str(r['protocol'] or '').lower()
+        raw_s = r['stream_settings'] if 'stream_settings' in fields else '{}'
+        rows.append({
+            'id': r['id'], 'protocol': protocol, 'port': port_int(r['port'], 'порт inbound'),
+            'enabled': bool(r['enable']) if 'enable' in fields else True,
+            'listen': (r['listen'] or '') if 'listen' in fields else '',
+            'remark': (r['remark'] or '') if 'remark' in fields else '',
+            'stream': load_obj(raw_s, 'stream_settings'),
+            'config': load_obj(r['settings'], 'settings'),
+        })
+    return rows
 
-def save_db(c, source, target, domain, cert, key, old_host=None, disable_tuic=False):
-    if pathlib.Path(source).resolve() == pathlib.Path(target).resolve():
-        raise ValueError("Нельзя изменять оригинал базы")
-    if pathlib.Path(target).exists():
-        raise ValueError("Выходной файл уже существует, отказ от перезаписи")
-    # SQLite can use WAL: a raw file copy may silently omit recent writes.
-    # The SQLite backup API captures one consistent database snapshot.
-    dst = sqlite3.connect(target)
+
+def sni_domain(val):
+    if not isinstance(val, str): return None
+    v = val.strip().lower()
+    if not v or not HOST_RE.fullmatch(v) or '..' in v or '.' not in v:
+        return None
+    return v
+
+
+def get_snis(r):
+    if r['protocol'] == 'mtproto':
+        d = sni_domain(r['config'].get('fakeTlsDomain'))
+        return [d] if d else []
+    s = r['stream']
+    if str(s.get('security', '')).lower() != 'reality':
+        return []
+    val = s.get('realitySettings', {}).get('serverNames', [])
+    if not isinstance(val, list): return []
+    return list(dict.fromkeys(filter(None, (sni_domain(x) for x in val))))
+
+
+def network(r):
+    return str(r['stream'].get('network', '')).lower()
+
+
+def http_route(r):
+    """Return a web route when it can be proxied through a local TLS terminator."""
+    if r['protocol'] in UDP_ONLY or r['protocol'] == 'mtproto': return None
+    s = r['stream']; net = network(r); sec = s.get('security', 'none')
+    if sec == 'reality': return None
+    if net == 'ws':
+        raw = (s.get('wsSettings') or {}).get('path')
+        if not raw: return None
+        p = check_path(raw.split('?',1)[0], 'wsSettings.path')
+        return {'kind':'ws', 'path':p, 'upstream':r['port'], 'tls': sec == 'tls', 'id':r['id']}
+    if net == 'grpc':
+        service = (s.get('grpcSettings') or {}).get('serviceName')
+        if not service: return None
+        p = check_path('/'+service.lstrip('/'), 'grpcSettings.serviceName')
+        return {'kind':'grpc', 'path':p.rstrip('/'), 'upstream':r['port'], 'tls':sec == 'tls', 'id':r['id']}
+    if net == 'xhttp':
+        raw = (s.get('xhttpSettings') or {}).get('path')
+        if not raw: return None
+        p = check_path(raw.split('?',1)[0], 'xhttpSettings.path')
+        return {'kind':'xhttp', 'path':p, 'upstream':r['port'], 'tls':sec == 'tls', 'id':r['id']}
+    return None
+
+
+def describe(c, public=None):
+    sc = settings(c)
+    if not sc.get('webPort') or not sc.get('webBasePath'):
+        raise ValueError('Не заданы webPort или webBasePath. Их необходимо указать в панели.')
+    web_port = port_int(sc['webPort'], 'webPort')
+    web_path = check_path(sc['webBasePath'], 'webBasePath')
+    sub_port = port_int(sc['subPort'], 'subPort') if sc.get('subPort') else None
+    sub_paths = []
+    if sub_port:
+        for k in ('subPath', 'subJsonPath', 'subClashPath'):
+            if sc.get(k):
+                p = check_path(sc[k], k)
+                if p not in sub_paths: sub_paths.append(p)
+    rows = row_data(c)
+    used_ports = {web_port, 443}
+    if sub_port: used_ports.add(sub_port)
+    used_ports.update(x['port'] for x in rows)
+    http_port = 10446 if 10446 not in used_ports else next((x for x in range(14000,16000) if x not in used_ports), None)
+    if http_port is None: raise ValueError('Не найден свободный внутренний порт Nginx HTTPS')
+    used_ports.add(http_port)
+
+    stream_candidates = []
+    web_routes = []
+    notes = []
+    for r in rows:
+        if not r['enabled']: continue
+        if r['protocol'] in UDP_ONLY: continue
+        if r['port'] == 443:
+            raise ValueError('В базе есть активный TCP inbound на 443; Nginx тоже должен слушать 443. Разреши конфликт порта вручную.')
+        snis = get_snis(r)
+        for name in snis:
+            stream_candidates.append({'sni':name, 'port':r['port'], 'id':r['id'],
+                'proxy': (r['protocol']=='mtproto' and r['config'].get('proxyProtocolListener') is True)
+                or (r['stream'].get('sockopt') or {}).get('acceptProxyProtocol') is True})
+        try:
+            route = http_route(r)
+        except ValueError:
+            route = None
+            notes.append(f"Inbound ID {r['id']}: неподходящий HTTP path; проверь маршрут вручную")
+        if route: web_routes.append(route)
+        if not snis and route is None:
+            notes.append(f"Inbound ID {r['id']} ({r['protocol']}:{r['port']}) сохранён без маршрута через HTTPS 443")
+    # Routes with ambiguous names are skipped, not silently misdirected.
+    from collections import defaultdict
+    by_sni=defaultdict(list)
+    for item in stream_candidates:
+        by_sni[item['sni']].append(item)
+    stream=[]
+    for name, items in by_sni.items():
+        if (public and name==public.lower()) or len({i['id'] for i in items})>1:
+            notes.append(f"SNI {name}: конфликт маршрутов; не добавлен в Nginx")
+        else: stream.append(items[0])
+    # Colliding HTTP path names may not be safely routed; skip those paths.
+    # Prefix service names of gRPC must not consume panel/subscription URLs.
+    reserved=[web_path]+sub_paths
+    unique=[]
+    for route in web_routes:
+        p=route['path']; conflicts=[r for r in web_routes if r['path']==p]
+        if len(conflicts)>1 or any(p==x or p.startswith(x.rstrip('/')+'/') or x.startswith(p.rstrip('/')+'/') for x in reserved):
+            notes.append(f"HTTP-маршрут {p}: пересечение путей; сохранён без правила Nginx")
+            continue
+        unique.append(route)
+    # The panel and subscription routes must not overlap each other.
+    for i,a in enumerate(reserved):
+        for b in reserved[i+1:]:
+            if a==b or a.startswith(b.rstrip('/')+'/') or b.startswith(a.rstrip('/')+'/'):
+                raise ValueError('Пересекаются пути панели и подписок. Исправь их в панели.')
+    next_port = (x for x in range(14000,16000) if x not in used_ports)
+    for route in stream:
+        if route['proxy']:
+            p=next(next_port)
+            route['relay']=p
+            used_ports.add(p)
+        else: route['relay']=None
+    return {
+       'web_port':web_port, 'web_path':web_path,
+       'sub_port':sub_port,'sub_paths':sub_paths,'http_port':http_port,
+       'clients':c.execute('SELECT count(*) FROM clients').fetchone()[0] if has_table(c,'clients') else 0,
+       'udp_ports': sorted({r['port'] for r in rows if r['enabled'] and r['protocol'] in UDP_ONLY and r['listen'] not in ('127.0.0.1','::1')}),
+       'inbounds':len(rows),'enabled':sum(x['enabled'] for x in rows),
+       'sni_routes':stream, 'http_routes':unique, 'notes':list(dict.fromkeys(notes)),
+    }
+
+
+def update_hosts(c, old, public, routes):
+    if not has_table(c,'hosts'): return
+    cols=columns(c,'hosts')
+    if not {'inbound_id','address','port'}.issubset(cols): return
+    proxy_ids={x['id'] for x in routes['sni_routes']} | {x['id'] for x in routes['http_routes']}
+    snis={x['id']:x['sni'] for x in routes['sni_routes']}
+    route_tls={x['id'] for x in routes['http_routes']}
+    for r in c.execute('SELECT id,inbound_id,address,port FROM hosts').fetchall():
+        addr=(r['address'] or '').strip()
+        # Don't hijack manually-entered unrelated destinations.
+        if addr not in ((old or ''), '', public): continue
+        updates={'address':public}
+        if r['inbound_id'] in proxy_ids:
+            updates['port']=443
+            if r['inbound_id'] in route_tls and 'security' in cols:
+                updates['security']='tls'
+            if r['inbound_id'] in snis and 'sni' in cols and not addr:
+                updates['sni']=snis[r['inbound_id']]
+        if 'updated_at' in cols: updates['updated_at']=int(time.time()*1000)
+        assign=', '.join(f'{k}=?' for k in updates)
+        c.execute(f'UPDATE hosts SET {assign} WHERE id=?', [*updates.values(),r['id']])
+    # Add missing default hosts for routed inbounds (optional schema).
+    for inbound_id in proxy_ids:
+        if c.execute('SELECT 1 FROM hosts WHERE inbound_id=?', (inbound_id,)).fetchone(): continue
+        values={'inbound_id':inbound_id,'address':public,'port':443}
+        if 'remark' in cols: values['remark']='HTTPS 443'
+        if 'group_id' in cols: values['group_id']=secrets.token_hex(8)
+        if 'sni' in cols and inbound_id in snis: values['sni']=snis[inbound_id]
+        if 'security' in cols: values['security']='tls' if inbound_id in route_tls else 'same'
+        if 'created_at' in cols: values['created_at']=int(time.time()*1000)
+        if 'updated_at' in cols: values['updated_at']=int(time.time()*1000)
+        columns_insert=','.join(values)
+        placeholders=','.join('?' for _ in values)
+        c.execute(f'INSERT INTO hosts ({columns_insert}) VALUES ({placeholders})',list(values.values()))
+
+
+def prepare(source, out, domain, cert, key, old_host=None, disable_tuic=False):
+    src = pathlib.Path(source).resolve(); dst=pathlib.Path(out).resolve()
+    if src==dst or dst.exists(): raise ValueError('Нельзя перезаписать исходную или существующую базу')
+    with conn_open(src) as c, sqlite3.connect(dst) as backup:
+        c.backup(backup)
     try:
-        c.backup(dst)
+        with conn_open(dst, readonly=False) as c:
+            with c:
+                sc=settings(c)
+                original_host=old_host or source_address(sc)
+                for key_name,value in {
+                    'webListen':'127.0.0.1', 'subListen':'127.0.0.1',
+                    'webCertFile':cert,'webKeyFile':key,
+                    'subCertFile':cert,'subKeyFile':key,
+                    'webDomain':domain,'subDomain':domain,
+                }.items():
+                    set_setting(c,key_name,value)
+                for field,path_field in [('subURI','subPath'),('subJsonURI','subJsonPath'),('subClashURI','subClashPath')]:
+                    if sc.get(path_field):
+                        set_setting(c,field,f'https://{domain}{check_path(sc[path_field],path_field)}')
+                fields=columns(c,'inbounds')
+                for r in row_data(c):
+                    s=r['stream']; d=r['config']; changed_s=False;changed_d=False
+                    tls=s.get('tlsSettings')
+                    if isinstance(tls,dict):
+                        for certificate in tls.get('certificates',[]) or []:
+                            if isinstance(certificate,dict):
+                                certificate['certificateFile']=cert
+                                certificate['keyFile']=key
+                                changed_s=True
+                        if tls.get('serverName') == original_host:
+                            tls['serverName']=domain;changed_s=True
+                    # TUIC versions use server certificates inside settings.
+                    srv=d.get('server')
+                    if r['protocol']=='tuic' and isinstance(srv,dict):
+                        if 'certificate' in srv: srv['certificate']=cert;changed_d=True
+                        if 'private_key' in srv: srv['private_key']=key;changed_d=True
+                        if original_host and srv.get('sni')==original_host:
+                            srv['sni']=domain;changed_d=True
+                    # Keep REALITY SNI/target/keys as configured by the user.
+                    for entry in s.get('externalProxy',[]) or []:
+                        if isinstance(entry,dict) and original_host and entry.get('dest')==original_host:
+                            entry['dest']=domain;changed_s=True
+                    if disable_tuic and r['protocol']=='tuic' and 'enable' in fields:
+                        c.execute('UPDATE inbounds SET enable=0 WHERE id=?',(r['id'],))
+                    if changed_s and 'stream_settings' in fields:
+                        c.execute('UPDATE inbounds SET stream_settings=? WHERE id=?',
+                                  (json.dumps(s,ensure_ascii=False,separators=(',',':')),r['id']))
+                    if changed_d:
+                        c.execute('UPDATE inbounds SET settings=? WHERE id=?',
+                                  (json.dumps(d,ensure_ascii=False,separators=(',',':')),r['id']))
+                routeinfo=describe(c, domain)
+                update_hosts(c,original_host,domain,routeinfo)
+            if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
+                raise ValueError('Нарушена целостность подготовленной копии')
     except Exception:
-        dst.close()
-        pathlib.Path(target).unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
         raise
-    finally:
-        dst.close()
-    t = connect(target, readonly=False)
-    try:
-        with t:
-            for k, v in {
-                "webListen": "127.0.0.1", "subListen": "127.0.0.1",
-                "webCertFile": cert, "webKeyFile": key,
-                "subCertFile": cert, "subKeyFile": key,
-                "subURI": f"https://{domain}{path(cfg(t)['subPath'])}",
-                "subJsonURI": f"https://{domain}{path(cfg(t)['subJsonPath'])}",
-                "subClashURI": f"https://{domain}{path(cfg(t)['subClashPath'])}",
-                "subDomain": domain,
-                "webDomain": domain,
-            }.items():
-                setting(t,k,v)
-            # On initial import, replace hosts from the original server.
-            # On later domain changes, replace ONLY the previously managed address.
-            if old_host:
-                t.execute("UPDATE hosts SET address=? WHERE address=?", (domain, old_host))
-            else:
-                t.execute("UPDATE hosts SET address=? WHERE address IS NOT NULL AND address != ''", (domain,))
-            migrate_vpn_reality(t, domain)
-            if disable_tuic:
-                tuic_rows = list(t.execute(
-                    "SELECT id FROM inbounds WHERE port=8444 AND lower(protocol)='tuic'"
-                ))
-                if len(tuic_rows) != 1:
-                    raise ValueError("Невозможно однозначно отключить TUIC 8444")
-                t.execute("UPDATE inbounds SET enable=0 WHERE id=?", (tuic_rows[0][0],))
-            for r in t.execute("SELECT id,stream_settings,settings,protocol FROM inbounds").fetchall():
-                s = json.loads(r["stream_settings"] or "{}")
-                d = json.loads(r["settings"] or "{}")
-                changed_s = changed_d = False
-                for e in s.get("externalProxy", []):
-                    if isinstance(e, dict) and e.get("dest"):
-                        e["dest"] = domain
-                        changed_s = True
-                if r['protocol'] == 'hysteria':
-                    tl = s.get('tlsSettings', {})
-                    tl['serverName'] = domain
-                    for e in tl.get('certificates', []):
-                        e['certificateFile'] = cert
-                        e['keyFile'] = key
-                    changed_s = True
-                if r['protocol'] == 'tuic' and isinstance(d.get('server'),dict):
-                    d['server']['certificate'] = cert
-                    d['server']['private_key'] = key
-                    d['server']['sni'] = domain
-                    changed_d = True
-                if changed_s:
-                    t.execute("UPDATE inbounds SET stream_settings=? WHERE id=?",(json.dumps(s,ensure_ascii=False,separators=(',',':')),r['id']))
-                if changed_d:
-                    t.execute("UPDATE inbounds SET settings=? WHERE id=?",(json.dumps(d,ensure_ascii=False,separators=(',',':')),r['id']))
-        if t.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-            raise ValueError('Нарушение целостности результата')
-    finally:
-        t.close()
 
 
 def nginx(c, domain, cert, key, http_out, stream_out):
-    d = describe(c)
-    # Nginx's stream module is loaded at the top level through Ubuntu's modules-enabled.
-    stream_conf = f'''# Generated from a PRIVATE 3x-ui DB. Must be included at nginx top level.
-stream {{
-    map $ssl_preread_server_name $vpn_3x_upstream {{
-        {d['xhttp_sni']} 127.0.0.1:10447;
-        {d['vless_sni']} 127.0.0.1:13133;
-        {d['mtproto_sni']} 127.0.0.1:10448;
-        default 127.0.0.1:10446;
-    }}
-    server {{
-        listen 443;
-        listen [::]:443;
-        ssl_preread on;
-        proxy_pass $vpn_3x_upstream;
-        proxy_connect_timeout 10s;
-        proxy_timeout 1h;
-        # Do NOT enable proxy_protocol here: plain REALITY on 13133 cannot read it.
-    }}
-    server {{
-        listen 127.0.0.1:10447;
-        proxy_pass 127.0.0.1:10444;
-        proxy_protocol on; # XHTTP expects this
-    }}
-    server {{
-        listen 127.0.0.1:10448;
-        proxy_pass 127.0.0.1:10445;
-        proxy_protocol on; # MTProto expects this
-    }}
-}}
-'''
-    ws_one,ws_two = d['ws_vless'],d['ws_vmess']
-    http_conf = f'''# Generated from private DB. TLS is terminated on local 10446 after TCP SNI routing.
+    d=describe(c,domain)
+    stream_map=['# Generated from actual enabled inbounds, without hardcoded role names or versions.',
+      'stream {','    map $ssl_preread_server_name $vpn_3x_upstream {']
+    stream_servers=[]
+    for r in d['sni_routes']:
+        target = r['relay'] or r['port']
+        stream_map.append(f"        {r['sni']} 127.0.0.1:{target};")
+        if r['relay']:
+            stream_servers.extend([
+             '    server {',f"        listen 127.0.0.1:{r['relay']};",
+             f"        proxy_pass 127.0.0.1:{r['port']};",'        proxy_protocol on;', '    }'])
+    stream_map += [f"        default 127.0.0.1:{d['http_port']};",'    }',
+     '    server {','        listen 443;','        listen [::]:443;',
+     '        ssl_preread on;','        proxy_pass $vpn_3x_upstream;',
+     '        proxy_connect_timeout 10s;','        proxy_timeout 1h;',
+     '    }',*stream_servers,'}']
+    root=f'''# Generated from real 3x-ui settings; public TLS termination.
 map $http_upgrade $connection_upgrade {{ default upgrade; '' close; }}
 server {{
-    listen 127.0.0.1:10446 ssl http2;
+    listen 127.0.0.1:{d['http_port']} ssl http2;
     server_name {domain};
     ssl_certificate {cert};
     ssl_certificate_key {key};
     ssl_protocols TLSv1.2 TLSv1.3;
     client_max_body_size 16m;
     error_page 404 /404.html;
-    location = /404.html {{
-        internal;
-        root /var/www/3x-ui-landing;
-    }}
-    location = {ws_one} {{
-        proxy_pass http://127.0.0.1:10451;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_set_header Host $host;
-    }}
-    location = {ws_two} {{
-        proxy_pass http://127.0.0.1:10452;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_set_header Host $host;
-    }}
-    location ^~ /{d['grpc_service']}/ {{
-        grpc_pass grpc://127.0.0.1:10453;
+    location = /404.html {{ internal; root /var/www/3x-ui-landing; }}
+'''
+    for route in d['http_routes']:
+        p=route['path']; dest=route['upstream']; tls=route['tls']; kind=route['kind']
+        if kind=='grpc':
+            scheme='grpcs' if tls else 'grpc'
+            root+=f'''    location ^~ {p}/ {{
+        grpc_pass {scheme}://127.0.0.1:{dest};
         grpc_set_header Host $host;
         grpc_read_timeout 1h;
     }}
-    location ^~ {d['web_path']} {{
+'''
+        else:
+            scheme='https' if tls else 'http'
+            matcher=f'= {p}' if kind=='ws' else f'^~ {p}'
+            root+=f'''    location {matcher} {{
+        proxy_pass {scheme}://127.0.0.1:{dest};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+'''
+            if kind=='ws':
+                root+='        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n'
+            if tls: root+='        proxy_ssl_verify off; # loopback upstream only\n'
+            root+='    }\n'
+    root+=f'''    location ^~ {d['web_path']} {{
         proxy_pass https://127.0.0.1:{d['web_port']};
-        # The upstream is the local 3x-ui HTTPS server, bound to loopback only.
-        # The public TLS connection is independently verified by the browser.
-        proxy_ssl_verify off;
+        proxy_ssl_verify off; # loopback upstream only
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Real-IP $remote_addr;
     }}
 '''
-    for sub_path in d['sub_paths']:
-        http_conf += f'''    location ^~ {sub_path} {{
+    if d['sub_port']:
+        for p in d['sub_paths']:
+            root+=f'''    location ^~ {p} {{
         proxy_pass https://127.0.0.1:{d['sub_port']};
-        # The upstream is the local 3x-ui HTTPS server, bound to loopback only.
-        # The public TLS connection is independently verified by the browser.
-        proxy_ssl_verify off;
+        proxy_ssl_verify off; # loopback upstream only
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
     }}
 '''
-    # The ordinary homepage is entirely static. It does not reveal or redirect
-    # visitors to the private panel. Admin and subscription paths above win.
-    http_conf += '''    location = / {
-        root /var/www/3x-ui-landing;
-        try_files /index.html =404;
-    }
-    location = /index.html {
-        root /var/www/3x-ui-landing;
-        try_files /index.html =404;
-    }
+    root+='''    location = / { root /var/www/3x-ui-landing; try_files /index.html =404; }
+    location = /index.html { root /var/www/3x-ui-landing; try_files /index.html =404; }
     location / { return 404; }
 }
 '''
-    pathlib.Path(http_out).write_text(http_conf)
-    pathlib.Path(stream_out).write_text(stream_conf)
+    pathlib.Path(http_out).write_text(root,encoding='utf-8')
+    pathlib.Path(stream_out).write_text('\n'.join(stream_map)+'\n',encoding='utf-8')
+    return d
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('mode', choices=['inspect','prepare','nginx'])
-    ap.add_argument('--db', required=True)
-    ap.add_argument('--domain')
-    ap.add_argument('--cert')
-    ap.add_argument('--key')
-    ap.add_argument('--out')
-    ap.add_argument('--old-host', default=None)
-    ap.add_argument('--disable-tuic', action='store_true',
-                    help='Только для подготовки импорта: временно выключить TUIC 8444 без удаления клиентов')
-    ap.add_argument('--http-out')
-    ap.add_argument('--stream-out')
-    args = ap.parse_args()
-    c = connect(args.db)
+    ap=argparse.ArgumentParser(description='Data-driven 3x-ui database preparer / Nginx generator')
+    ap.add_argument('mode',choices=['inspect','prepare','nginx'])
+    ap.add_argument('--db',required=True)
+    ap.add_argument('--domain');ap.add_argument('--cert');ap.add_argument('--key')
+    ap.add_argument('--out');ap.add_argument('--old-host')
+    ap.add_argument('--disable-tuic',action='store_true')
+    ap.add_argument('--http-out');ap.add_argument('--stream-out')
+    args=ap.parse_args()
+    c=conn_open(args.db)
     try:
-        d = describe(c)
-        if args.mode == 'inspect':
+        if args.mode=='inspect':
+            d=describe(c)
             print(json.dumps(d,ensure_ascii=False,indent=2))
             return
-        if not all([args.domain,args.cert,args.key]):
-            ap.error('Нужно указать --domain, --cert, --key')
-        domain=validate_domain(args.domain)
-        for p in (args.cert,args.key):
-            if not p.startswith('/') or not re.fullmatch(r'/[A-Za-z0-9_.\-/]+', p):
-                raise ValueError('Используй абсолютные пути к сертификатам без пробелов')
-        if args.mode=='prepare':
-            if not args.out: ap.error('Нужен --out')
-            save_db(c,args.db,args.out,domain,args.cert,args.key,args.old_host,
-                    disable_tuic=args.disable_tuic)
-            print('Копия базы подготовлена; источник не изменён.')
-            if args.disable_tuic:
-                print('В подготовленной копии TUIC 8444 временно выключен; его клиенты и ключи сохранены.')
-        else:
-            if not args.http_out or not args.stream_out:
-                ap.error('Нужны --http-out и --stream-out')
-            nginx(c,domain,args.cert,args.key,args.http_out,args.stream_out)
-            print('Nginx config generated.')
-    finally:
-        c.close()
+    finally:c.close()
+    if not all([args.domain,args.cert,args.key]):ap.error('Нужны --domain, --cert, --key')
+    host=public_host(args.domain)
+    if any(not CERT_RE.fullmatch(x) or '..' in x for x in (args.cert,args.key)):
+        ap.error('Сертификат и ключ должны иметь абсолютные безопасные пути')
+    if args.mode=='prepare':
+        if not args.out:ap.error('Нужен --out')
+        prepare(args.db,args.out,host,args.cert,args.key,args.old_host,args.disable_tuic)
+        print('Копия базы подготовлена; оригинал не изменён.')
+        if args.disable_tuic: print('TUIC временно выключен в копии; записи клиентов сохранены.')
+    else:
+        if not args.http_out or not args.stream_out:ap.error('Нужны --http-out и --stream-out')
+        with conn_open(args.db) as c:
+            d=nginx(c,host,args.cert,args.key,args.http_out,args.stream_out)
+            for note in d['notes']:print('ПРЕДУПРЕЖДЕНИЕ:',note,file=sys.stderr)
+            print(f"Nginx config generated for {d['enabled']} enabled / {d['inbounds']} total inbounds.")
 
 if __name__=='__main__':
     try:main()
-    except (ValueError,sqlite3.Error,KeyError,IndexError,TypeError,FileNotFoundError) as e:
-        print(f'ОШИБКА: {e}',file=sys.stderr);sys.exit(1)
+    except (ValueError,sqlite3.Error,TypeError,KeyError,OSError) as exc:
+        print('ОШИБКА:',str(exc),file=sys.stderr)
+        sys.exit(1)
