@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# PROJECT_VERSION=2.5.0
 # 3x-ui server bootstrap. NO database is needed or imported at this stage.
 # Intended for a NEW Ubuntu VPS. Source files must be published in the same GitHub repository.
 set -Eeuo pipefail
@@ -9,6 +10,7 @@ umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
 
+readonly PROJECT_VERSION='2.5.0'
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified
@@ -81,6 +83,39 @@ if [[ -r /etc/ssh/sshd_config ]]; then
   fi
 fi
 
+# Freeze all source components BEFORE changing system services. This prevents
+# mixing an old setup.sh with newer stack-manager.sh/db_tool.py from GitHub.
+# If a multi-file GitHub upload is incomplete, abort while SSH/UFW remain intact.
+PHASE='Проверка комплекта исходных файлов'
+SOURCE_STAGE=$(mktemp -d /tmp/3x-ui-source.XXXXXXXX)
+trap 'rm -rf -- "${SOURCE_STAGE:-/nonexistent}"' EXIT
+printf "[3x-ui] Verifying release %s files before installation...\n" "$PROJECT_VERSION"
+SOURCE_ITEMS=(
+  setup.sh configure-after-import.sh change-domain.sh stack-manager.sh db_tool.py reality-443.sh
+  landing/install.sh landing/index.html landing/404.html
+  wireguard/setup.sh wireguard/manage.sh
+)
+for src in "${SOURCE_ITEMS[@]}"; do
+  mkdir -p "${SOURCE_STAGE}/$(dirname "$src")"
+  curl --fail --location --silent --show-error --retry 2 --connect-timeout 10 --max-time 35 \
+    "${REPO_RAW_BASE}/${src}" -o "${SOURCE_STAGE}/${src}" \
+    || die "Не удалось загрузить ${src}; проверь GitHub."
+  [[ -s "${SOURCE_STAGE}/${src}" ]] || die "Пустой файл ${src}."
+  grep -Fq "PROJECT_VERSION=${PROJECT_VERSION}" "${SOURCE_STAGE}/${src}" \
+    || die "Версии файлов не совпадают: ${src}. Опубликуй ВСЕ файлы одного архива в GitHub."
+  case "$src" in
+    *.sh) bash -n "${SOURCE_STAGE}/${src}" || die "Ошибка Bash в ${src}." ;;
+    *.py) python3 - "${SOURCE_STAGE}/${src}" <<'CHECKPY' || die "Ошибка Python в ${src}."
+import ast,sys
+with open(sys.argv[1],encoding='utf-8') as f: ast.parse(f.read())
+CHECKPY
+      ;;
+  esac
+done
+[[ -f "${0}" ]] && cmp -s -- "$0" "${SOURCE_STAGE}/setup.sh" \
+  || die 'Скачанный setup.sh отличается от опубликованной версии. Загрузи весь новый проект в GitHub и скачай setup.sh заново.'
+printf "[3x-ui] Release %s files verified.\n" "$PROJECT_VERSION"
+
 # Configure a Cyrillic-capable console font BEFORE the first Russian prompts.
 # Same safe approach as our 3ax-server-setup: do not change OS-wide language.
 PHASE='Preparing console font'
@@ -133,7 +168,7 @@ case "${HAS_DOMAIN,,}" in
     read -r -p 'Введи домен (например, vpn.example.org): ' SSL_DOMAIN
     SSL_DOMAIN=${SSL_DOMAIN,,}
     [[ "$SSL_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ && ${#SSL_DOMAIN} -le 253 ]] || die 'Некорректный домен.'
-    for blocked in apple.com www.amazon.com www.samsung.com; do
+    for blocked in dl.google.com apple.com www.amazon.com www.samsung.com; do
       [[ "$SSL_DOMAIN" != "$blocked" ]] || die 'Нельзя использовать чужой домен маскировки как свой.'
     done
     ;;
@@ -201,9 +236,10 @@ for spec in \
   'configure-after-import.sh /usr/local/sbin/3x-ui-after-import' \
   'change-domain.sh /usr/local/sbin/3x-ui-change-domain' \
   'stack-manager.sh /usr/local/sbin/3x-ui-stack-manager' \
+  'reality-443.sh /usr/local/sbin/3x-ui-reality-443' \
   'db_tool.py /usr/local/lib/3x-ui-setup/db_tool.py'; do
   read -r src dest <<< "$spec"
-  curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/${src}" -o "${dest}.tmp" || die "Не удалось скачать ${src} из репозитория. Проверь публикацию всех файлов."
+  cp -a "${SOURCE_STAGE}/${src}" "${dest}.tmp"
   if [[ "$src" == *.sh ]]; then bash -n "${dest}.tmp" || die 'Ошибка синтаксиса помощника'; else python3 - "${dest}.tmp" <<'PY' || die 'Ошибка Python-синтаксиса помощника'
 import ast,sys
 ast.parse(open(sys.argv[1],encoding='utf-8').read())
@@ -217,7 +253,7 @@ PHASE='Подготовка помощника WireGuard'
 for spec in 'wireguard/setup.sh /usr/local/sbin/3x-ui-wg-setup' \
             'wireguard/manage.sh /usr/local/sbin/3x-ui-wg'; do
   read -r src dest <<< "$spec"
-  curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/${src}" -o "${dest}.tmp" || die "Не удалось скачать ${src}. Убедись, что папка wireguard опубликована в GitHub."
+  cp -a "${SOURCE_STAGE}/${src}" "${dest}.tmp"
   bash -n "${dest}.tmp" || die "Ошибка синтаксиса ${src}."
   install -m 755 -o root -g root "${dest}.tmp" "$dest"
   rm -f "${dest}.tmp"
@@ -271,7 +307,6 @@ ufw allow 22/tcp comment 'TEMPORARY SSH access'
 ufw allow 1335/tcp comment 'Admin SSH'
 ufw allow 80/tcp comment 'Certificate ACME HTTP-01'
 ufw allow 443/tcp comment 'Nginx stream TLS'
-ufw allow 13133/tcp comment 'VLESS Reality direct'
 ufw allow 51820/udp comment 'Standalone WireGuard wg0'
 for p in 443 8444 51821 51822; do ufw allow "$p/udp" comment '3x-ui UDP inbound'; done
 ufw --force enable
@@ -360,9 +395,9 @@ chmod 600 "$SSL_STATE_FILE"
 PHASE='Первичный HTTPS через Nginx'
 say 'Устанавливаю природную страницу-заглушку и локальный HTTPS-прокси панели.'
 LANDING_INSTALL="$BACKUP_DIR/landing-install.sh"
-curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/landing/install.sh" -o "$LANDING_INSTALL" || die 'Не удалось скачать установщик сайта-заглушки.'
+cp -a "${SOURCE_STAGE}/landing/install.sh" "$LANDING_INSTALL"
 bash -n "$LANDING_INSTALL" || die 'Ошибка синтаксиса установщика сайта-заглушки.'
-bash "$LANDING_INSTALL" "$SSL_HOST" "$SSL_CERT" "$SSL_KEY" "$PANEL_PORT" "$REPO_RAW_BASE" || die 'Не удалось установить сайт-заглушку.'
+bash "$LANDING_INSTALL" "$SSL_HOST" "$SSL_CERT" "$SSL_KEY" "$PANEL_PORT" "file://${SOURCE_STAGE}" || die 'Не удалось установить сайт-заглушку.'
 python3 - <<'PYNGINX'
 from pathlib import Path
 import re

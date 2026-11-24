@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# PROJECT_VERSION=2.5.0
 # CLI for root-only WireGuard profiles, exporting via authenticated SSH account.
 set -Eeuo pipefail
 umask 077

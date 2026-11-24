@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# PROJECT_VERSION=2.5.0
 # Restart ONLY the known pre-panel Fail2ban interruption from 3x-ui-server-setup.
 # Never reset the current SSH user or UFW. Do not use on a live 3x-ui server.
 set -Eeuo pipefail
@@ -6,6 +7,7 @@ umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
 
+readonly PROJECT_VERSION='2.5.0'
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified
@@ -44,6 +46,9 @@ grep -qx 'Port 1335' "$SSH_DROPIN" || die 'Порт 1335 не подготовл
 [[ ! -f "$SSL_STATE_FILE" && ! -f /etc/nginx/stream.conf.d/00-3x-ui-bootstrap.conf ]] || die 'Сертификат или Nginx уже настроены; продолжение запрещено.'
 [[ ! -e /usr/local/x-ui/x-ui && ! -e /etc/x-ui/x-ui.db ]] || die 'Панель уже установлена; этот сценарий восстановления не подходит.'
 [[ -f /etc/nginx/nginx.conf ]] || die 'Nginx не установлен.'
+if ! grep -Fqx "# PROJECT_VERSION=${PROJECT_VERSION}" /usr/local/sbin/3x-ui-stack-manager; then
+  warn 'Версия уже установленного помощника отличается от версии продолжения. Проверь совместимость файлов.'
+fi
 [[ $(ufw status 2>/dev/null | head -1) == 'Status: active' ]] || die 'UFW не активен.'
 for port in 22 1335; do
   ss -H -ltn "sport = :${port}" | grep -q . || die "SSH не слушает порт ${port}."
@@ -53,6 +58,26 @@ EFFECTIVE_PORTS=$(/usr/sbin/sshd -T | awk '$1=="port"{print $2}' | sort -n | pas
 if [[ -f /etc/systemd/system/ssh.socket.d/00-3xui-bootstrap.conf ]]; then SSH_SOCKET_ACTIVE=1; fi
 BACKUP_DIR=$(find /root -maxdepth 1 -type d -name '3x-ui-setup-backup-*' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
 [[ -n "$BACKUP_DIR" && -f "$BACKUP_DIR/sshd_config.bak" ]] || die 'Не найдена оригинальная резервная копия SSH.'
+
+# Verify the rescue script and its dependencies are a single published release.
+# Do this BEFORE modifying Fail2ban, installing the panel, or changing firewall.
+PHASE='Проверка совместимости файлов продолжения'
+SOURCE_STAGE=$(mktemp -d /tmp/3x-ui-resume-source.XXXXXXXX)
+trap 'rm -rf -- "${SOURCE_STAGE:-/nonexistent}"' EXIT
+for src in resume-after-fail2ban.sh landing/install.sh landing/index.html landing/404.html wireguard/setup.sh wireguard/manage.sh; do
+  mkdir -p "${SOURCE_STAGE}/$(dirname "$src")"
+  curl --fail --location --silent --show-error --retry 2 --connect-timeout 10 --max-time 35 \
+    "${REPO_RAW_BASE}/${src}" -o "${SOURCE_STAGE}/${src}" \
+    || die "Не удалось загрузить ${src} из GitHub."
+  [[ -s "${SOURCE_STAGE}/${src}" ]] || die "Пустой файл ${src}."
+  grep -Fq "PROJECT_VERSION=${PROJECT_VERSION}" "${SOURCE_STAGE}/${src}" \
+    || die "Неполная публикация ${PROJECT_VERSION} в GitHub: ${src}."
+  case "$src" in *.sh) bash -n "${SOURCE_STAGE}/${src}" || die "Ошибка Bash в ${src}." ;; esac
+done
+[[ -f "$0" ]] && cmp -s -- "$0" "${SOURCE_STAGE}/resume-after-fail2ban.sh" \
+  || die 'Версия запускаемого resume-after-fail2ban.sh отличается от GitHub. Скачай заново.'
+grep -Fqx "# PROJECT_VERSION=${PROJECT_VERSION}" /usr/local/sbin/3x-ui-stack-manager \
+  || die 'Установленный помощник другого выпуска; безопасное продолжение невозможно.'
 
 cat <<'INTRO'
 Предыдущая установка остановилась на Fail2ban. Это продолжение сохранит
@@ -69,7 +94,7 @@ case "${HAS_DOMAIN,,}" in
     read -r -p 'Введи домен (например, vpn.example.org): ' SSL_DOMAIN
     SSL_DOMAIN=${SSL_DOMAIN,,}
     [[ "$SSL_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ && ${#SSL_DOMAIN} -le 253 ]] || die 'Некорректный домен.'
-    for blocked in apple.com www.amazon.com www.samsung.com; do
+    for blocked in dl.google.com apple.com www.amazon.com www.samsung.com; do
       [[ "$SSL_DOMAIN" != "$blocked" ]] || die 'Нельзя использовать домен маскировки в качестве своего.'
     done
     ;;
@@ -89,7 +114,7 @@ PHASE='Подготовка помощника WireGuard'
 for spec in 'wireguard/setup.sh /usr/local/sbin/3x-ui-wg-setup' \
             'wireguard/manage.sh /usr/local/sbin/3x-ui-wg'; do
   read -r src dest <<< "$spec"
-  curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/${src}" -o "${dest}.tmp" || die "Не удалось скачать ${src}. Убедись, что папка wireguard опубликована в GitHub."
+  cp -a "${SOURCE_STAGE}/${src}" "${dest}.tmp"
   bash -n "${dest}.tmp" || die "Ошибка синтаксиса ${src}."
   install -m 755 -o root -g root "${dest}.tmp" "$dest"
   rm -f "${dest}.tmp"
@@ -192,9 +217,9 @@ chmod 600 "$SSL_STATE_FILE"
 PHASE='Первичный HTTPS через Nginx'
 say 'Устанавливаю природную страницу-заглушку и локальный HTTPS-прокси панели.'
 LANDING_INSTALL="$BACKUP_DIR/landing-install.sh"
-curl -fLsS --retry 3 --connect-timeout 20 "${REPO_RAW_BASE}/landing/install.sh" -o "$LANDING_INSTALL" || die 'Не удалось скачать установщик сайта-заглушки.'
+cp -a "${SOURCE_STAGE}/landing/install.sh" "$LANDING_INSTALL"
 bash -n "$LANDING_INSTALL" || die 'Ошибка синтаксиса установщика сайта-заглушки.'
-bash "$LANDING_INSTALL" "$SSL_HOST" "$SSL_CERT" "$SSL_KEY" "$PANEL_PORT" "$REPO_RAW_BASE" || die 'Не удалось установить сайт-заглушку.'
+bash "$LANDING_INSTALL" "$SSL_HOST" "$SSL_CERT" "$SSL_KEY" "$PANEL_PORT" "file://${SOURCE_STAGE}" || die 'Не удалось установить сайт-заглушку.'
 python3 - <<'PYNGINX'
 from pathlib import Path
 import re

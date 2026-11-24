@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PROJECT_VERSION=2.5.0
 """Private SQLite migration + nginx generation for the specific 3x-ui database.
 This program never prints passwords, keys, client UUIDs or tokens.
 """
@@ -9,6 +10,8 @@ import pathlib
 import re
 import sqlite3
 import sys
+import secrets
+import time
 
 NAME = re.compile(r"^[a-zA-Z0-9.-]+$")
 PATH = re.compile(r"^/[a-zA-Z0-9_./-]*$")
@@ -124,6 +127,56 @@ def describe(c):
     return result
 
 
+
+REALITY_SNI = "dl.google.com"
+OLD_REALITY_SNI = "apple.com"
+
+
+def migrate_vpn_reality(c, public_address):
+    """Only our named VPN inbound. Preserves keys, UUIDs, stats and unrelated inbounds."""
+    r = inbound(c, "VPN")
+    if r["port"] != 13133 or r["protocol"] != "vless":
+        raise ValueError("VPN inbound differs from expected VLESS TCP:13133")
+    s = json.loads(r["stream_settings"] or "{}")
+    if s.get("network") != "tcp" or s.get("security") != "reality":
+        raise ValueError("VPN is not TCP Reality")
+    if s.get("externalProxy"):
+        raise ValueError("VPN contains legacy externalProxy entries; review manually")
+    reality = s.get("realitySettings") or {}
+    if reality.get("serverNames") not in ([OLD_REALITY_SNI], [REALITY_SNI]):
+        raise ValueError("Unexpected VPN Reality serverNames; refusing migration")
+    if reality.get("target") not in (f"{OLD_REALITY_SNI}:443", f"{REALITY_SNI}:443"):
+        raise ValueError("Unexpected VPN Reality target; refusing migration")
+    client_sni = reality.get("settings", {}).get("serverName", "")
+    if client_sni not in ("", OLD_REALITY_SNI, REALITY_SNI):
+        raise ValueError("Unexpected VPN Reality client serverName")
+    reality["serverNames"] = [REALITY_SNI]
+    reality["target"] = f"{REALITY_SNI}:443"
+    if isinstance(reality.get("settings"), dict):
+        reality["settings"]["serverName"] = REALITY_SNI
+    s["realitySettings"] = reality
+    c.execute("UPDATE inbounds SET stream_settings=?, listen=? WHERE id=?", (
+        json.dumps(s, ensure_ascii=False, separators=(",", ":")), "127.0.0.1", r["id"]))
+    hosts = c.execute("SELECT id,address,port FROM hosts WHERE inbound_id=?", (r["id"],)).fetchall()
+    if len(hosts) > 1:
+        raise ValueError("Multiple VPN Hosts found; review before migration")
+    if hosts:
+        h = hosts[0]
+        if h["address"] not in ("", None, public_address):
+            raise ValueError("VPN Host has an external custom address; review before migration")
+        if h["port"] not in (0, 13133, 443):
+            raise ValueError("VPN Host uses unexpected port")
+        c.execute("""UPDATE hosts SET address=?,port=443,security='same',sni=?,
+          override_sni_from_address=0,keep_sni_blank=0,is_disabled=0,is_hidden=0,
+          updated_at=? WHERE id=?""", (public_address, REALITY_SNI, int(time.time()*1000), h["id"]))
+    else:
+        now = int(time.time() * 1000)
+        c.execute("""INSERT INTO hosts
+          (group_id,inbound_id,sort_order,remark,is_disabled,is_hidden,address,port,
+           security,sni,override_sni_from_address,keep_sni_blank,created_at,updated_at)
+          VALUES (?,?,0,?,0,0,?,443,'same',?,0,0,?,?)""",
+          (secrets.token_hex(8),r["id"],"VLESS Reality 443",public_address,REALITY_SNI,now,now))
+
 def save_db(c, source, target, domain, cert, key, old_host=None):
     if pathlib.Path(source).resolve() == pathlib.Path(target).resolve():
         raise ValueError("Нельзя изменять оригинал базы")
@@ -160,6 +213,7 @@ def save_db(c, source, target, domain, cert, key, old_host=None):
                 t.execute("UPDATE hosts SET address=? WHERE address=?", (domain, old_host))
             else:
                 t.execute("UPDATE hosts SET address=? WHERE address IS NOT NULL AND address != ''", (domain,))
+            migrate_vpn_reality(t, domain)
             for r in t.execute("SELECT id,stream_settings,settings,protocol FROM inbounds").fetchall():
                 s = json.loads(r["stream_settings"] or "{}")
                 d = json.loads(r["settings"] or "{}")

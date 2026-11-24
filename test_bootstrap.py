@@ -42,6 +42,10 @@ assert 'wireguard/setup.sh' in resume and 'wireguard/manage.sh' in resume
 assert '3x-ui-bootstrap.conf' in manager and 'rm -f "$STREAM_BOOT" "$HTTP_BOOT_LINK"' in manager
 assert 'Стартовая страница ответила HTTP' in setup and 'Стартовая страница ответила HTTP' in resume
 assert 'Сайт-заглушка ответил' in manager
+assert "--noproxy '*'" in manager
+assert 'SECONDS - start < 12' in manager
+assert 'Локальная панель не ответила' in manager
+assert 'Не удалось соединиться с панелью через Nginx/TCP 443' in manager
 landing_html=(root/'landing/index.html').read_text()
 assert '<!doctype html>' in landing_html.lower() and '<title>Тихие маршруты' in landing_html
 assert '<svg' in landing_html and '<script' not in landing_html.lower()

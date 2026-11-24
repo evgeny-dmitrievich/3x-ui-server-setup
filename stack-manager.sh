@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
+# PROJECT_VERSION=2.5.0
 # 3x-ui setup v2: preserve panel credentials, paths, and all VPN identities.
 # Maintains the Nginx SNI routes and HTTPS certificates for the imported database.
 set -Eeuo pipefail
 umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
+PROJECT_VERSION='2.5.0'
 STATE=/etc/3x-ui-setup/bootstrap.env
 LIVE_DB=/etc/x-ui/x-ui.db
 DB_TOOL=/usr/local/lib/3x-ui-setup/db_tool.py
@@ -95,6 +97,8 @@ HELP
 if [[ ${1:-} == '--help' || ${1:-} == '-h' ]]; then usage; exit 0; fi
 [[ $EUID -eq 0 ]] || die 'Нужны права root (sudo).'
 [[ -r "$STATE" && -f "$DB_TOOL" && -f "$NGINX_MAIN" && -f "$LIVE_DB" ]] || die 'Нет состояния установки, панели или базы.'
+grep -Fqx "# PROJECT_VERSION=${PROJECT_VERSION}" "$DB_TOOL" \
+  || die "Версии db_tool.py и stack-manager.sh не совпадают. Обнови оба файла из одного выпуска ${PROJECT_VERSION}; база не изменена."
 [[ -x "$ACME" ]] || die 'Не установлен acme.sh (официальная установка 3x-ui должна его создать).'
 command -v flock >/dev/null || die 'Нет команды flock.'
 exec 9>/run/3x-ui-stack-manager.lock
@@ -250,6 +254,12 @@ healthcheck() {
     return 1
   fi
   [[ "$code" == 404 ]] || { warn "Несуществующая страница ответила HTTP ${code} вместо 404."; return 1; }
+  # Local HTTPS uses -k intentionally (loopback). Check the PUBLIC certificate
+  # separately with system CAs, without aborting a reachable production panel.
+  if ! curl --noproxy '*' -sS -o /dev/null --connect-timeout 2 --max-time 5 \
+      --resolve "${host}:443:127.0.0.1" "https://${host}/" 2>/dev/null; then
+    warn 'Внешний сертификат не прошёл проверку доверия системным хранилищем CA; проверь цепочку SSL отдельно.'
+  fi
   say 'Панель отвечает через Nginx; сайт-заглушка HTTP 200 и страница 404 проверены.'
 }
 
@@ -258,7 +268,7 @@ apply_stack() {
   CURRENT_STEP='Проверка базы и Nginx'
   [[ -t 0 ]] || die 'Требуется интерактивный терминал.'
   validate_host "$new_host" || die 'Некорректный домен или IPv4.'
-  [[ "$new_host" != apple.com && "$new_host" != www.amazon.com && "$new_host" != www.samsung.com ]] || die 'Нельзя использовать домен-маскировку как публичный адрес.'
+  [[ "$new_host" != dl.google.com && "$new_host" != apple.com && "$new_host" != www.amazon.com && "$new_host" != www.samsung.com ]] || die 'Нельзя использовать домен-маскировку как публичный адрес.'
   python3 "$DB_TOOL" inspect --db "$LIVE_DB" > /dev/null || die 'База не соответствует ожидаемой схеме.'
   [[ -s /var/www/3x-ui-landing/index.html ]] || die 'Не найдена страница-заглушка. Проверь файлы установки.' 
   [[ -s /var/www/3x-ui-landing/404.html ]] || die 'Не найдена страница 404. Проверь файлы установки.' 

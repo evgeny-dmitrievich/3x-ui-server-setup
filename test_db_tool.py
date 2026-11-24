@@ -39,7 +39,12 @@ with tempfile.TemporaryDirectory() as temp:
                 if k in x: assert x[k]==y[k],f'{k} changed'
             if x['remark']=='VPN':
                 assert json.loads(x['settings'])==json.loads(y['settings'])
-                assert json.loads(x['stream_settings'])==json.loads(y['stream_settings']), 'REALITY changed'
+                before=json.loads(x['stream_settings'])
+                after=json.loads(y['stream_settings'])
+                assert after['realitySettings']['serverNames']==['dl.google.com']
+                assert after['realitySettings']['target']=='dl.google.com:443'
+                assert after['realitySettings']['privateKey']==before['realitySettings']['privateKey']
+                assert x['port']==y['port'] and y['listen']=='127.0.0.1'
         old_settings={k:v for k,v in sqlite3.connect(src).execute('select key,value from settings')}
         new_settings={k:v for k,v in sqlite3.connect(p).execute('select key,value from settings')}
         for k in ('webBasePath','subPath','subJsonPath','subClashPath','webPort','subPort'):
@@ -55,7 +60,7 @@ with tempfile.TemporaryDirectory() as temp:
         assert f'server_name {host}' in http
         assert 'proxy_ssl_verify off;' in http and 'proxy_ssl_verify on;' not in http
         assert 'ssl_preread on;' in routing and 'proxy_protocol on;' in routing
-        assert 'apple.com 127.0.0.1:13133;' in routing
+        assert 'dl.google.com 127.0.0.1:13133;' in routing
         assert 'grpc_pass' in http and '10446' in http
         assert 'root /var/www/3x-ui-landing;' in http
         assert 'location = / {' in http and 'location = /index.html {' in http
