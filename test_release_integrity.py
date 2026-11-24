@@ -4,9 +4,9 @@ from pathlib import Path
 import subprocess
 import ast
 root=Path(__file__).resolve().parent
-version='2.5.0'
+version='2.6.0'
 files=[
-'setup.sh','reality-443.sh','configure-after-import.sh','change-domain.sh','stack-manager.sh',
+'setup.sh','reality-443.sh','prepare-import.sh','configure-after-import.sh','change-domain.sh','stack-manager.sh',
 'db_tool.py','landing/install.sh','landing/index.html','landing/404.html',
 'wireguard/setup.sh','wireguard/manage.sh','resume-after-fail2ban.sh',
 ]
@@ -38,4 +38,8 @@ resume=(root/'resume-after-fail2ban.sh').read_text()
 assert 'cp -a "${SOURCE_STAGE}/landing/install.sh"' in resume
 assert 'cmp -s -- "$0" "${SOURCE_STAGE}/resume-after-fail2ban.sh"' in resume
 assert 'sudo 3x-ui-after-import' in setup
+assert 'prepare-import.sh /usr/local/sbin/3x-ui-prepare-import' in setup
+assert 'prepare-import.sh' in setup
+assert 'INBOUND_SPECS' in db and 'Не хватает подключений из нашей объединённой базы' not in db
+assert 'disable_tuic' in db
 print('PASS: file bundle, syntax, version checks, console, Fail2ban, Nginx and rollback guards')

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.5.0
+# PROJECT_VERSION=2.6.0
 # 3x-ui setup v2: preserve panel credentials, paths, and all VPN identities.
 # Maintains the Nginx SNI routes and HTTPS certificates for the imported database.
 set -Eeuo pipefail
 umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-PROJECT_VERSION='2.5.0'
+PROJECT_VERSION='2.6.0'
 STATE=/etc/3x-ui-setup/bootstrap.env
 LIVE_DB=/etc/x-ui/x-ui.db
 DB_TOOL=/usr/local/lib/3x-ui-setup/db_tool.py
@@ -88,6 +88,7 @@ usage() {
 Команды (от root):
   3x-ui-after-import                 После восстановления базы через панель.
   3x-ui-change-domain                Меню: домен, IP, сертификат, проверка.
+  3x-ui-prepare-import /path/to/db    СНАЧАЛА создаёт копию для импорта, исправляя пути TLS.
 
 Никакие логины/пароли, пути панели и UUID не меняются.
 После смены публичного адреса старые ссылки подписок потребуется заменить.
@@ -269,7 +270,7 @@ apply_stack() {
   [[ -t 0 ]] || die 'Требуется интерактивный терминал.'
   validate_host "$new_host" || die 'Некорректный домен или IPv4.'
   [[ "$new_host" != dl.google.com && "$new_host" != apple.com && "$new_host" != www.amazon.com && "$new_host" != www.samsung.com ]] || die 'Нельзя использовать домен-маскировку как публичный адрес.'
-  python3 "$DB_TOOL" inspect --db "$LIVE_DB" > /dev/null || die 'База не соответствует ожидаемой схеме.'
+  python3 "$DB_TOOL" inspect --db "$LIVE_DB" > /dev/null || die 'В активной базе не найдены нужные протоколы по портам. Возможно восстановление было отклонено. Подготовь исходный файл через 3x-ui-prepare-import, импортируй его и только затем повтори эту команду.'
   [[ -s /var/www/3x-ui-landing/index.html ]] || die 'Не найдена страница-заглушка. Проверь файлы установки.' 
   [[ -s /var/www/3x-ui-landing/404.html ]] || die 'Не найдена страница 404. Проверь файлы установки.' 
   if [[ "$phase" == after-import ]]; then

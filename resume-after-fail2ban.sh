@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.5.0
+# PROJECT_VERSION=2.6.0
 # Restart ONLY the known pre-panel Fail2ban interruption from 3x-ui-server-setup.
 # Never reset the current SSH user or UFW. Do not use on a live 3x-ui server.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
 
-readonly PROJECT_VERSION='2.5.0'
+readonly PROJECT_VERSION='2.6.0'
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified

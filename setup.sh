@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.5.0
+# PROJECT_VERSION=2.6.0
 # 3x-ui server bootstrap. NO database is needed or imported at this stage.
 # Intended for a NEW Ubuntu VPS. Source files must be published in the same GitHub repository.
 set -Eeuo pipefail
@@ -10,7 +10,7 @@ umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
 
-readonly PROJECT_VERSION='2.5.0'
+readonly PROJECT_VERSION='2.6.0'
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified
@@ -91,7 +91,7 @@ SOURCE_STAGE=$(mktemp -d /tmp/3x-ui-source.XXXXXXXX)
 trap 'rm -rf -- "${SOURCE_STAGE:-/nonexistent}"' EXIT
 printf "[3x-ui] Verifying release %s files before installation...\n" "$PROJECT_VERSION"
 SOURCE_ITEMS=(
-  setup.sh configure-after-import.sh change-domain.sh stack-manager.sh db_tool.py reality-443.sh
+  setup.sh configure-after-import.sh change-domain.sh stack-manager.sh db_tool.py reality-443.sh prepare-import.sh
   landing/install.sh landing/index.html landing/404.html
   wireguard/setup.sh wireguard/manage.sh
 )
@@ -237,6 +237,7 @@ for spec in \
   'change-domain.sh /usr/local/sbin/3x-ui-change-domain' \
   'stack-manager.sh /usr/local/sbin/3x-ui-stack-manager' \
   'reality-443.sh /usr/local/sbin/3x-ui-reality-443' \
+  'prepare-import.sh /usr/local/sbin/3x-ui-prepare-import' \
   'db_tool.py /usr/local/lib/3x-ui-setup/db_tool.py'; do
   read -r src dest <<< "$spec"
   cp -a "${SOURCE_STAGE}/${src}" "${dest}.tmp"
@@ -492,11 +493,14 @@ cat <<END
    Посмотреть случайный путь и логин/пароль панели:
    sudo cat /etc/x-ui/install-result.env
 
-2) В панели вручную восстанови свою SQLite-базу через Backup/Restore.
-   После импорта адрес/порт панели могут измениться и доступ временно
-   пропадёт: это нормально, следующий этап восстановит правильный маршрут.
+2) Сначала подготовь исходный SQLite-файл без изменения активной базы:
+   sudo 3x-ui-prepare-import /home/USER/source.db
+   Затем импортируй полученный *-prepared-*.db через Backup/Restore.
+   Если TUIC мешает старту Xray, после проверки журналов попробуй:
+   sudo 3x-ui-prepare-import --disable-tuic /home/USER/source.db
+   Этот вариант отключает только TUIC, не удаляет его клиентов.
 
-3) После импорта выполни НА СЕРВЕРЕ:
+3) Только ПОСЛЕ успешного импорта выполни НА СЕРВЕРЕ:
    sudo 3x-ui-after-import
    Он использует уже выданный сертификат для ${SSL_HOST},
    маршрутизирует VPN через TCP 443 и обновит адреса подписок.

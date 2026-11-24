@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.5.0
+# PROJECT_VERSION=2.6.0
 # Migrate our named VPN VLESS Reality from apple.com/13133 to dl.google.com/443.
 # Does not touch other inbounds, credentials, WireGuard, or the public TLS cert.
 set -Eeuo pipefail

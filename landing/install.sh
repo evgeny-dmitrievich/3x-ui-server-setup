@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.5.0
+# PROJECT_VERSION=2.6.0
 # Install an entirely offline public landing page and the pre-import HTTPS router.
 # Invoked by setup.sh or resume-after-fail2ban.sh on a CLEAN VPS.
 set -Eeuo pipefail

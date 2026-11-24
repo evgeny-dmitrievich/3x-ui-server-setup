@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# PROJECT_VERSION=2.5.0
+# PROJECT_VERSION=2.6.0
 """Private SQLite migration + nginx generation for the specific 3x-ui database.
 This program never prints passwords, keys, client UUIDs or tokens.
 """
@@ -55,10 +55,29 @@ def setting(c, name, value):
         c.execute("INSERT INTO settings(key,value) VALUES(?,?)", (name, str(value)))
 
 
-def inbound(c, remark):
-    rows = list(c.execute("SELECT * FROM inbounds WHERE remark=?", (remark,)))
+# Match stable inbound parameters instead of user-editable display names.
+# Custom names and emoji are encouraged in subscriptions, so remarks must
+# never be used as persistent identifiers for infrastructure provisioning.
+INBOUND_SPECS = {
+    'VPN': (13133, 'vless'),
+    'XHTTP': (10444, 'vless'),
+    'VLESS-WS': (10451, 'vless'),
+    'VMess-WS': (10452, 'vmess'),
+    'Trojan-gRPC': (10453, 'trojan'),
+    'MTProto': (10445, 'mtproto'),
+}
+
+
+def inbound(c, role):
+    port, protocol = INBOUND_SPECS[role]
+    rows = list(c.execute(
+        "SELECT * FROM inbounds WHERE port=? AND lower(protocol)=?",
+        (port, protocol),
+    ))
     if len(rows) != 1:
-        raise ValueError(f"Ожидалось ровно одно подключение '{remark}', найдено {len(rows)}")
+        raise ValueError(
+            f"Для роли {role} ожидалось одно подключение {protocol}:{port}; найдено {len(rows)}"
+        )
     return rows[0]
 
 
@@ -84,10 +103,10 @@ def describe(c):
     for k in needed:
         if not sc.get(k):
             raise ValueError(f"Отсутствует настройка {k}")
-    by_name = {r["remark"] for r in c.execute("SELECT remark FROM inbounds")}
-    expected = {"VPN", "XHTTP", "VLESS-WS", "VMess-WS", "Trojan-gRPC", "MTProto"}
-    if not expected <= by_name:
-        raise ValueError("Не хватает подключений из нашей объединённой базы")
+    # Display remarks may have been renamed (including emoji).
+    # Verify the required roles by their unique port+protocol instead.
+    for role in INBOUND_SPECS:
+        inbound(c, role)
     x = stream(c, "XHTTP")
     v = stream(c, "VPN")
     mt = json.loads(inbound(c, "MTProto")["settings"] or "{}")
@@ -177,7 +196,7 @@ def migrate_vpn_reality(c, public_address):
           VALUES (?,?,0,?,0,0,?,443,'same',?,0,0,?,?)""",
           (secrets.token_hex(8),r["id"],"VLESS Reality 443",public_address,REALITY_SNI,now,now))
 
-def save_db(c, source, target, domain, cert, key, old_host=None):
+def save_db(c, source, target, domain, cert, key, old_host=None, disable_tuic=False):
     if pathlib.Path(source).resolve() == pathlib.Path(target).resolve():
         raise ValueError("Нельзя изменять оригинал базы")
     if pathlib.Path(target).exists():
@@ -214,6 +233,13 @@ def save_db(c, source, target, domain, cert, key, old_host=None):
             else:
                 t.execute("UPDATE hosts SET address=? WHERE address IS NOT NULL AND address != ''", (domain,))
             migrate_vpn_reality(t, domain)
+            if disable_tuic:
+                tuic_rows = list(t.execute(
+                    "SELECT id FROM inbounds WHERE port=8444 AND lower(protocol)='tuic'"
+                ))
+                if len(tuic_rows) != 1:
+                    raise ValueError("Невозможно однозначно отключить TUIC 8444")
+                t.execute("UPDATE inbounds SET enable=0 WHERE id=?", (tuic_rows[0][0],))
             for r in t.execute("SELECT id,stream_settings,settings,protocol FROM inbounds").fetchall():
                 s = json.loads(r["stream_settings"] or "{}")
                 d = json.loads(r["settings"] or "{}")
@@ -356,6 +382,8 @@ def main():
     ap.add_argument('--key')
     ap.add_argument('--out')
     ap.add_argument('--old-host', default=None)
+    ap.add_argument('--disable-tuic', action='store_true',
+                    help='Только для подготовки импорта: временно выключить TUIC 8444 без удаления клиентов')
     ap.add_argument('--http-out')
     ap.add_argument('--stream-out')
     args = ap.parse_args()
@@ -373,8 +401,11 @@ def main():
                 raise ValueError('Используй абсолютные пути к сертификатам без пробелов')
         if args.mode=='prepare':
             if not args.out: ap.error('Нужен --out')
-            save_db(c,args.db,args.out,domain,args.cert,args.key,args.old_host)
+            save_db(c,args.db,args.out,domain,args.cert,args.key,args.old_host,
+                    disable_tuic=args.disable_tuic)
             print('Копия базы подготовлена; источник не изменён.')
+            if args.disable_tuic:
+                print('В подготовленной копии TUIC 8444 временно выключен; его клиенты и ключи сохранены.')
         else:
             if not args.http_out or not args.stream_out:
                 ap.error('Нужны --http-out и --stream-out')
