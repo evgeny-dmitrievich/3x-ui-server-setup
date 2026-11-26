@@ -73,6 +73,14 @@ with tempfile.TemporaryDirectory() as td:
         http=tmp/f'http-{size}.conf';stream=tmp/f'stream-{size}.conf'
         call('nginx','--db',out,*params,'--http-out',http,'--stream-out',stream)
         h=http.read_text(); st=stream.read_text()
+        # WebSocket support belongs to the panel location itself, not just VPN WS.
+        assert 'map $http_upgrade $connection_upgrade' in h
+        panel=h.split(f"location ^~ {inspect['web_path']}", 1)[1].split('}',1)[0]
+        assert 'proxy_pass https://127.0.0.1:57875;' in panel
+        for directive in ('proxy_http_version 1.1;',
+                          'proxy_set_header Upgrade $http_upgrade;',
+                          'proxy_set_header Connection $connection_upgrade;'):
+            assert panel.count(directive) == 1, directive
         assert 'proxy_ssl_verify off;' in h
         assert 'proxy_ssl_verify on;' not in h
         assert 'root /var/www/3x-ui-landing' in h

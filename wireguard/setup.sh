@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.8.0
+# PROJECT_VERSION=2.8.1
 # Install standalone, kernel WireGuard. This is intentionally separate from 3x-ui/Xray.
 set -Eeuo pipefail
 umask 077

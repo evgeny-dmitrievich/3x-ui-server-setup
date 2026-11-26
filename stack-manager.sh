@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.8.0
+# PROJECT_VERSION=2.8.1
 # 3x-ui setup v2: preserve panel credentials, paths, and all VPN identities.
 # Maintains the Nginx SNI routes and HTTPS certificates for the imported database.
 set -Eeuo pipefail
 umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-PROJECT_VERSION='2.8.0'
+PROJECT_VERSION='2.8.1'
 STATE=/etc/3x-ui-setup/bootstrap.env
 LIVE_DB=/etc/x-ui/x-ui.db
 DB_TOOL=/usr/local/lib/3x-ui-setup/db_tool.py

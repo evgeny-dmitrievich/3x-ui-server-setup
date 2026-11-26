@@ -32,6 +32,8 @@ assert 'healthcheck "$LIVE_DB" "$TARGET_HOST"' in manager
 assert 'snapshot_configs' in manager and 'restore_configs' in manager
 assert 'live-before.db' in manager
 assert 'proxy_ssl_verify off;' in db and 'proxy_ssl_verify on;' not in db
+assert 'proxy_set_header Upgrade $http_upgrade;' in db
+assert 'proxy_set_header Connection $connection_upgrade;' in db
 assert 'webBasePath' in db and 'webPort' in db
 assert 'ssl_preread on;' in db
 assert 'get_snis' in db and 'http_route' in db and 'udp_ports' in db

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.8.0
+# PROJECT_VERSION=2.8.1
 # Stage a copy of a foreign 3x-ui SQLite backup BEFORE panel restore.
 # Never change /etc/x-ui/x-ui.db, active nginx, WireGuard, or SSH.
 set -Eeuo pipefail

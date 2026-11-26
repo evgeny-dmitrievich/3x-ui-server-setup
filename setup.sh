@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PROJECT_VERSION=2.8.0
+# PROJECT_VERSION=2.8.1
 # 3x-ui server bootstrap. NO database is needed or imported at this stage.
 # Intended for a NEW Ubuntu VPS. Source files must be published in the same GitHub repository.
 set -Eeuo pipefail
@@ -10,7 +10,7 @@ umask 077
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a UCF_FORCE_CONFFOLD=1
 
-readonly PROJECT_VERSION='2.8.0'
+readonly PROJECT_VERSION='2.8.1'
 readonly SSH_PORT=1335
 readonly PANEL_PORT=13350
 readonly VERIFY_MARKER=/run/3xui-ssh-verified

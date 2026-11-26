@@ -15,7 +15,7 @@ import sys
 import time
 from urllib.parse import urlparse
 
-PROJECT_VERSION = '2.8.0'
+PROJECT_VERSION = '2.8.1'
 HOST_RE = re.compile(r'^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$', re.I)
 PATH_RE = re.compile(r'^/[a-zA-Z0-9_./~%-]*$')
 CERT_RE = re.compile(r'^/[A-Za-z0-9_.\-/]+$')
@@ -414,6 +414,9 @@ server {{
             root+='    }\n'
     root+=f'''    location ^~ {d['web_path']} {{
         proxy_pass https://127.0.0.1:{d['web_port']};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
         proxy_ssl_verify off; # loopback upstream only
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
